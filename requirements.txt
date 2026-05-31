@@ -1,0 +1,5 @@
+python-telegram-bot>=21.3,<23.0
+yfinance>=0.2.60,<0.3.0
+pandas>=2.2.0
+numpy>=1.26.0
+python-dotenv>=1.0.1

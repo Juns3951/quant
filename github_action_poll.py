@@ -58,7 +58,13 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
 
     allowed = allowed_chat_ids()
     if allowed and int(chat_id) not in allowed:
-        send_message(token, chat_id, "이 봇을 사용할 권한이 없는 채팅입니다.")
+        send_message(
+            token,
+            chat_id,
+            "이 봇을 사용할 권한이 없는 채팅입니다.\n"
+            f"현재 chat id: {chat_id}\n"
+            "이 번호를 ALLOWED_CHAT_IDS에 추가하세요.",
+        )
         return
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()

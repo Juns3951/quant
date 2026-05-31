@@ -46,7 +46,11 @@ async def run_analysis(update: Update, raw_text: str) -> None:
     allowed = allowed_chat_ids()
     chat_id = update.effective_chat.id if update.effective_chat else None
     if allowed and chat_id not in allowed:
-        await update.message.reply_text("이 봇을 사용할 권한이 없는 채팅입니다.")
+        await update.message.reply_text(
+            "이 봇을 사용할 권한이 없는 채팅입니다.\n"
+            f"현재 chat id: {chat_id}\n"
+            "이 번호를 ALLOWED_CHAT_IDS에 추가하세요."
+        )
         return
 
     ticker, period = parse_request(raw_text)

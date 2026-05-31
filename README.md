@@ -97,6 +97,8 @@ BENCHMARK_TICKER=SPY
 
 그룹방에서 쓸 때는 봇을 그룹에 초대하고 `/analyze AAPL`처럼 명령어로 호출하는 편이 안전합니다. 일반 텍스트 `AAPL`까지 그룹에서 읽게 하려면 `@BotFather`의 `/setprivacy`에서 해당 봇의 privacy mode를 끄세요.
 
+`이 봇을 사용할 권한이 없는 채팅입니다`가 뜨면 토큰 문제가 아니라 `ALLOWED_CHAT_IDS` 값이 현재 채팅방의 `chat.id`와 다르다는 뜻입니다. 답장에 표시되는 `현재 chat id`를 그대로 GitHub Actions secret의 `ALLOWED_CHAT_IDS`에 넣고 다시 실행하세요.
+
 ## 테스트
 
 인터넷 없이 분석 로직만 간단히 확인하려면 다음을 실행하세요.

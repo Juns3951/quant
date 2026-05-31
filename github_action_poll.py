@@ -68,6 +68,10 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
         return
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    if command in {"/chatid", "/id"}:
+        send_message(token, chat_id, f"현재 chat id: {chat_id}")
+        return
+
     if command in {"/start", "/help"}:
         send_message(token, chat_id, help_message())
         return

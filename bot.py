@@ -35,6 +35,12 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await run_analysis(update, " ".join(context.args))
 
 
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.effective_chat is None:
+        return
+    await update.message.reply_text(f"현재 chat id: {update.effective_chat.id}")
+
+
 async def analyze_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_analysis(update, update.message.text or "")
 
@@ -84,6 +90,7 @@ def build_application() -> Application:
 
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler(["chatid", "id"], chatid_command))
     app.add_handler(CommandHandler(["analyze", "a"], analyze_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_text))
     return app

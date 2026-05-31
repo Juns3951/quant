@@ -99,6 +99,8 @@ BENCHMARK_TICKER=SPY
 
 `이 봇을 사용할 권한이 없는 채팅입니다`가 뜨면 토큰 문제가 아니라 `ALLOWED_CHAT_IDS` 값이 현재 채팅방의 `chat.id`와 다르다는 뜻입니다. 답장에 표시되는 `현재 chat id`를 그대로 GitHub Actions secret의 `ALLOWED_CHAT_IDS`에 넣고 다시 실행하세요.
 
+가장 확실한 확인 방법은 봇에게 `/chatid` 또는 `/id`를 보내는 것입니다. 이 명령은 `ALLOWED_CHAT_IDS`가 틀려도 현재 채팅방의 id를 답장하도록 되어 있습니다.
+
 ## 테스트
 
 인터넷 없이 분석 로직만 간단히 확인하려면 다음을 실행하세요.

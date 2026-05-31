@@ -56,6 +56,11 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
     if chat_id is None or not text:
         return
 
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    if command in {"/chatid", "/id"}:
+        send_message(token, chat_id, f"현재 chat id: {chat_id}")
+        return
+
     allowed = allowed_chat_ids()
     if allowed and int(chat_id) not in allowed:
         send_message(
@@ -65,11 +70,6 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
             f"현재 chat id: {chat_id}\n"
             "이 번호를 ALLOWED_CHAT_IDS에 추가하세요.",
         )
-        return
-
-    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-    if command in {"/chatid", "/id"}:
-        send_message(token, chat_id, f"현재 chat id: {chat_id}")
         return
 
     if command in {"/start", "/help"}:
@@ -98,13 +98,15 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
 
 def help_message() -> str:
     return (
-        "티커를 보내면 GitHub Actions에서 기술적 지표 분석을 실행하고 답장합니다.\n\n"
+        "티커를 보내면 GitHub Actions에서 장기 투자용 EMA50/SMA200 추세 필터, "
+        "ATR 추적 손절, 장기 백테스트, 켈리 비중을 분석해 답장합니다.\n\n"
         "예시:\n"
         "AAPL\n"
-        "TSLA 2y\n"
-        "/analyze NVDA 1y\n"
+        "TSLA\n"
+        "/analyze NVDA\n"
         "005930.KS\n"
-        "035420.KQ\n\n"
+        "035420.KQ\n"
+        "/chatid\n\n"
         "주의: GitHub Actions 스케줄 방식은 보통 몇 분 단위로 응답합니다."
     )
 

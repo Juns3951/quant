@@ -2,43 +2,58 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import sqrt
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 
-@dataclass(frozen=True)
-class FilterResult:
-    name: str
-    passed: bool
-    detail: str
+LONGTERM_START = "1986-01-01"
+TRADING_DAYS = 252
 
 
 @dataclass(frozen=True)
-class AnalysisResult:
+class LongTermResult:
     ticker: str
     as_of: str
-    action: str
-    confidence: str
-    regime: str
-    score: int
-    latest: dict[str, float]
-    filters: list[FilterResult]
-    risk_levels: dict[str, float]
-    bullish_points: list[str]
-    bearish_points: list[str]
-    warnings: list[str]
-    kill_switch: list[str]
-    false_breakout_flags: list[str]
+    start_date: str
     rows: int
+    action: str
+    regime: str
+    confidence: str
+    current_price: float
+    ema50: float
+    sma200: float
+    atr14: float
+    atr_multiplier: float
+    trailing_stop: float
+    initial_stop: float
+    golden_cross_today: bool
+    death_cross_today: bool
+    invested_now: bool
+    market_exposure: float
+    cagr_strategy: float
+    cagr_buy_hold: float
+    mdd_strategy: float
+    mdd_buy_hold: float
+    cumulative_strategy: float
+    cumulative_buy_hold: float
+    annual_return: float
+    annual_volatility: float
+    risk_free_rate: float
+    kelly_fraction: float
+    suggested_fractional_kelly: float
+    warnings: list[str]
+    insights: list[str]
+    frame: pd.DataFrame | None = None
 
 
 class AnalyzerError(RuntimeError):
     pass
 
 
-def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
+def fetch_history(ticker: str, period: str = "max", start: str = LONGTERM_START) -> pd.DataFrame:
     try:
         import yfinance as yf
     except ImportError as exc:
@@ -46,7 +61,15 @@ def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
             "yfinance가 설치되어 있지 않습니다. `pip install -r requirements.txt`를 먼저 실행하세요."
         ) from exc
 
-    data = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+    cache_dir = Path(__file__).resolve().parent / ".yfinance-cache"
+    cache_dir.mkdir(exist_ok=True)
+    yf.set_tz_cache_location(str(cache_dir))
+
+    if period == "max":
+        data = yf.Ticker(ticker).history(start=start, interval="1d", auto_adjust=True)
+    else:
+        data = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+
     if data.empty:
         raise AnalyzerError(f"{ticker} 데이터를 가져오지 못했습니다. 티커 표기를 확인하세요.")
     return data
@@ -54,81 +77,72 @@ def fetch_history(ticker: str, period: str = "1y") -> pd.DataFrame:
 
 def analyze_ticker(
     ticker: str,
-    period: str = "1y",
-    benchmark_ticker: str | None = "SPY",
-) -> AnalysisResult:
+    period: str = "max",
+    benchmark_ticker: str | None = None,
+) -> LongTermResult:
+    del benchmark_ticker
     ticker = ticker.strip().upper()
-    price_frame = fetch_history(ticker, period=period)
-
-    benchmark_frame = None
-    if benchmark_ticker:
-        try:
-            benchmark_frame = fetch_history(benchmark_ticker, period=max_period(period, "1y"))
-        except Exception:
-            benchmark_frame = None
-
-    vix_frame = None
-    try:
-        vix_frame = fetch_history("^VIX", period="3mo")
-    except Exception:
-        vix_frame = None
-
-    return analyze_price_frame(
-        ticker=ticker,
-        frame=price_frame,
-        benchmark_frame=benchmark_frame,
-        vix_frame=vix_frame,
-    )
+    effective_period = normalize_longterm_period(period)
+    frame = fetch_history(ticker, period=effective_period)
+    return analyze_price_frame(ticker=ticker, frame=frame)
 
 
 def analyze_price_frame(
     ticker: str,
     frame: pd.DataFrame,
-    benchmark_frame: pd.DataFrame | None = None,
-    vix_frame: pd.DataFrame | None = None,
-) -> AnalysisResult:
-    df = calculate_indicators(clean_price_frame(frame))
-    df = df.dropna(subset=["Close", "EMA_50", "RSI", "MACD", "ATR_14", "ADX_14"])
-    if len(df) < 60:
-        raise AnalyzerError("분석에 필요한 일봉 데이터가 부족합니다. 최소 60개 이상의 캔들이 필요합니다.")
+    atr_multiplier: float = 3.5,
+    risk_free_rate: float = 0.03,
+    initial_capital: float = 10_000_000.0,
+) -> LongTermResult:
+    df = calculate_longterm_backtest(
+        clean_price_frame(frame),
+        atr_multiplier=atr_multiplier,
+        initial_capital=initial_capital,
+    )
+    df = df.dropna(subset=["Close", "EMA_50", "SMA_200", "ATR_14"])
+    if len(df) < 220:
+        raise AnalyzerError("장기 분석에 필요한 데이터가 부족합니다. 최소 220거래일 이상이 필요합니다.")
 
     latest = df.iloc[-1]
     prev = df.iloc[-2]
-    regime = classify_regime(latest)
-    filters = build_filter_chain(latest, prev)
-    false_breakout_flags = detect_false_breakout(df)
-    kill_switch = detect_kill_switch(df, benchmark_frame, vix_frame)
-    bullish_points, bearish_points = explain_signals(latest, prev, regime, false_breakout_flags)
-    score = composite_score(latest, prev, filters, false_breakout_flags, kill_switch)
-    risk_levels = build_risk_levels(df)
-    action = decide_action(score, filters, latest, kill_switch, false_breakout_flags, risk_levels)
-    confidence = confidence_label(score, filters, kill_switch, false_breakout_flags)
+    metrics = performance_metrics(df, risk_free_rate=risk_free_rate)
+    action = decide_longterm_action(latest, prev)
+    regime = classify_longterm_regime(latest)
+    insights, warnings = explain_longterm(latest, prev, metrics, atr_multiplier)
 
-    warnings = [
-        "본 결과는 기술적 지표 기반 참고용 분석이며 투자 조언이나 수익 보장을 의미하지 않습니다.",
-        "yfinance 데이터는 지연/누락될 수 있으므로 실제 주문 전 증권사 시세로 재확인하세요.",
-    ]
-    if latest["Volume_Ratio"] < 0.7:
-        warnings.append("최근 거래량이 20일 평균보다 낮아 신호 신뢰도가 떨어질 수 있습니다.")
-    if latest["ATR_Ratio"] > 1.5:
-        warnings.append("ATR이 평소보다 급등해 손절 폭과 포지션 크기를 보수적으로 잡아야 합니다.")
-
-    return AnalysisResult(
-        ticker=ticker,
+    return LongTermResult(
+        ticker=ticker.strip().upper(),
         as_of=format_date(df.index[-1]),
-        action=action,
-        confidence=confidence,
-        regime=regime,
-        score=score,
-        latest=latest_to_dict(latest),
-        filters=filters,
-        risk_levels=risk_levels,
-        bullish_points=bullish_points,
-        bearish_points=bearish_points,
-        warnings=warnings,
-        kill_switch=kill_switch,
-        false_breakout_flags=false_breakout_flags,
+        start_date=format_date(df.index[0]),
         rows=len(df),
+        action=action,
+        regime=regime,
+        confidence=confidence_label(latest, metrics),
+        current_price=float(latest["Close"]),
+        ema50=float(latest["EMA_50"]),
+        sma200=float(latest["SMA_200"]),
+        atr14=float(latest["ATR_14"]),
+        atr_multiplier=float(atr_multiplier),
+        trailing_stop=float(latest["ATR_Trailing_Stop"]),
+        initial_stop=float(latest["Close"] - atr_multiplier * latest["ATR_14"]),
+        golden_cross_today=bool(latest["Golden_Cross"]),
+        death_cross_today=bool(latest["Death_Cross"]),
+        invested_now=bool(latest["Invested"]),
+        market_exposure=float(metrics["market_exposure"]),
+        cagr_strategy=float(metrics["cagr_strategy"]),
+        cagr_buy_hold=float(metrics["cagr_buy_hold"]),
+        mdd_strategy=float(metrics["mdd_strategy"]),
+        mdd_buy_hold=float(metrics["mdd_buy_hold"]),
+        cumulative_strategy=float(metrics["cumulative_strategy"]),
+        cumulative_buy_hold=float(metrics["cumulative_buy_hold"]),
+        annual_return=float(metrics["annual_return"]),
+        annual_volatility=float(metrics["annual_volatility"]),
+        risk_free_rate=float(risk_free_rate),
+        kelly_fraction=float(metrics["kelly_fraction"]),
+        suggested_fractional_kelly=float(metrics["suggested_fractional_kelly"]),
+        warnings=warnings,
+        insights=insights,
+        frame=df,
     )
 
 
@@ -155,397 +169,189 @@ def clean_price_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_longterm_backtest(
+    df: pd.DataFrame,
+    atr_multiplier: float = 3.5,
+    initial_capital: float = 10_000_000.0,
+) -> pd.DataFrame:
     out = df.copy()
     close = out["Close"]
-    high = out["High"]
-    low = out["Low"]
-    volume = out["Volume"]
-
-    out["EMA_10"] = close.ewm(span=10, adjust=False).mean()
-    out["EMA_20"] = close.ewm(span=20, adjust=False).mean()
     out["EMA_50"] = close.ewm(span=50, adjust=False).mean()
-    out["EMA_200"] = close.ewm(span=200, adjust=False).mean()
-    out["RSI"] = rsi(close)
-    out["MACD"], out["MACD_Signal"], out["MACD_Hist"] = macd(close)
-    out["ATR_14"] = atr(high, low, close)
-    out["ADX_14"] = adx(high, low, close)
+    out["SMA_200"] = close.rolling(200).mean()
+    out["ATR_14"] = atr(out["High"], out["Low"], close)
 
-    bb_middle = close.rolling(20).mean()
-    bb_std = close.rolling(20).std(ddof=0)
-    out["BB_Middle"] = bb_middle
-    out["BB_Upper"] = bb_middle + (2.0 * bb_std)
-    out["BB_Lower"] = bb_middle - (2.0 * bb_std)
-    out["BB_Width"] = (out["BB_Upper"] - out["BB_Lower"]) / bb_middle.replace(0.0, np.nan)
+    out["Bull_Regime"] = out["EMA_50"] > out["SMA_200"]
+    prev_bull = out["Bull_Regime"].shift(1).fillna(False)
+    out["Golden_Cross"] = out["Bull_Regime"] & ~prev_bull
+    out["Death_Cross"] = ~out["Bull_Regime"] & prev_bull
 
-    typical_price = (high + low + close) / 3.0
-    rolling_volume = volume.rolling(20).sum()
-    out["VWAP_20"] = (typical_price * volume).rolling(20).sum() / rolling_volume.replace(0.0, np.nan)
-    out["Volume_MA20"] = volume.rolling(20).mean()
-    out["Volume_Ratio"] = volume / out["Volume_MA20"].replace(0.0, np.nan)
-    out["ATR_MA20"] = out["ATR_14"].rolling(20).mean()
-    out["ATR_Ratio"] = out["ATR_14"] / out["ATR_MA20"].replace(0.0, np.nan)
-    out["Realized_Vol_5D"] = close.pct_change().rolling(5).std(ddof=0)
+    regime_group = out["Bull_Regime"].ne(out["Bull_Regime"].shift()).cumsum()
+    regime_high = close.where(out["Bull_Regime"]).groupby(regime_group).cummax()
+    out["ATR_Trailing_Stop"] = regime_high - (atr_multiplier * out["ATR_14"])
 
-    rsi_min = out["RSI"].rolling(14).min()
-    rsi_max = out["RSI"].rolling(14).max()
-    out["Stoch_RSI_K"] = 100.0 * (out["RSI"] - rsi_min) / (rsi_max - rsi_min).replace(0.0, np.nan)
-    out["Stoch_RSI_D"] = out["Stoch_RSI_K"].rolling(3).mean()
+    stop_ok = (close >= out["ATR_Trailing_Stop"]) | out["ATR_Trailing_Stop"].isna()
+    out["Invested_Raw"] = out["Bull_Regime"] & stop_ok
+    out["Invested"] = out["Invested_Raw"].shift(1).fillna(False).astype(bool)
+
+    out["Asset_Return"] = close.pct_change().fillna(0.0)
+    out["Strategy_Return"] = out["Asset_Return"] * out["Invested"].astype(float)
+    out["Buy_Hold_Equity"] = initial_capital * (1.0 + out["Asset_Return"]).cumprod()
+    out["Strategy_Equity"] = initial_capital * (1.0 + out["Strategy_Return"]).cumprod()
+    out["Strategy_Drawdown"] = out["Strategy_Equity"] / out["Strategy_Equity"].cummax() - 1.0
+    out["Buy_Hold_Drawdown"] = out["Buy_Hold_Equity"] / out["Buy_Hold_Equity"].cummax() - 1.0
     return out
 
 
-def rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    value = 100.0 - (100.0 / (1.0 + rs))
-    value = value.where(avg_loss != 0.0, 100.0)
-    value = value.where(avg_gain != 0.0, 0.0)
-    return value
-
-
-def macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
-    ema_12 = close.ewm(span=12, adjust=False).mean()
-    ema_26 = close.ewm(span=26, adjust=False).mean()
-    line = ema_12 - ema_26
-    signal = line.ewm(span=9, adjust=False).mean()
-    return line, signal, line - signal
-
-
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
     high_low = high - low
     high_close = (high - close.shift()).abs()
     low_close = (low - close.shift()).abs()
-    return pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    return true_range(high, low, close).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+def performance_metrics(df: pd.DataFrame, risk_free_rate: float = 0.03) -> dict[str, float]:
+    years = max((df.index[-1] - df.index[0]).days / 365.25, 1 / 365.25)
+    cumulative_strategy = df["Strategy_Equity"].iloc[-1] / df["Strategy_Equity"].iloc[0]
+    cumulative_buy_hold = df["Buy_Hold_Equity"].iloc[-1] / df["Buy_Hold_Equity"].iloc[0]
+    cagr_strategy = cumulative_strategy ** (1.0 / years) - 1.0
+    cagr_buy_hold = cumulative_buy_hold ** (1.0 / years) - 1.0
 
+    annual_return = df["Asset_Return"].mean() * TRADING_DAYS
+    annual_volatility = df["Asset_Return"].std(ddof=0) * sqrt(TRADING_DAYS)
+    kelly_fraction = 0.0
+    if annual_volatility > 0:
+        kelly_fraction = (annual_return - risk_free_rate) / (annual_volatility**2)
 
-def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0)
-
-    atr_value = atr(high, low, close, period)
-    plus_di = 100.0 * pd.Series(plus_dm, index=high.index).ewm(
-        alpha=1 / period, min_periods=period, adjust=False
-    ).mean() / atr_value.replace(0.0, np.nan)
-    minus_di = 100.0 * pd.Series(minus_dm, index=high.index).ewm(
-        alpha=1 / period, min_periods=period, adjust=False
-    ).mean() / atr_value.replace(0.0, np.nan)
-    dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0.0, np.nan)
-    return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-
-
-def classify_regime(latest: pd.Series) -> str:
-    if latest["ATR_Ratio"] >= 1.5 or latest["BB_Width"] >= 0.18:
-        return "변동성 급증 국면"
-    if latest["ADX_14"] >= 20:
-        if latest["Close"] > latest["EMA_50"] and latest["EMA_10"] > latest["EMA_50"]:
-            return "강한 상승 추세 국면"
-        if latest["Close"] < latest["EMA_50"] and latest["EMA_10"] < latest["EMA_50"]:
-            return "하락 추세 국면"
-        return "추세 전환 감시 국면"
-    return "박스권/평균회귀 국면"
-
-
-def build_filter_chain(latest: pd.Series, prev: pd.Series) -> list[FilterResult]:
-    trend_pass = bool(latest["Close"] > latest["EMA_50"] and latest["ADX_14"] > 20)
-    rsi_rebound = bool(prev["RSI"] <= 30 < latest["RSI"])
-    rsi_constructive = bool(30 < latest["RSI"] < 70)
-    macd_bull = bool(latest["MACD"] > latest["MACD_Signal"])
-    momentum_pass = bool(macd_bull and (rsi_rebound or rsi_constructive))
-    volume_pass = bool(latest["Volume_Ratio"] > 1.5 and latest["Close"] > latest["VWAP_20"])
-
-    return [
-        FilterResult(
-            "1단계 추세",
-            trend_pass,
-            f"종가 {fmt(latest['Close'])} / EMA50 {fmt(latest['EMA_50'])} / ADX {latest['ADX_14']:.1f}",
-        ),
-        FilterResult(
-            "2단계 모멘텀",
-            momentum_pass,
-            f"RSI {latest['RSI']:.1f} / MACD {fmt(latest['MACD'])} vs Signal {fmt(latest['MACD_Signal'])}",
-        ),
-        FilterResult(
-            "3단계 거래량",
-            volume_pass,
-            f"거래량 {latest['Volume_Ratio']:.2f}배 / VWAP20 {fmt(latest['VWAP_20'])}",
-        ),
-    ]
-
-
-def detect_false_breakout(df: pd.DataFrame) -> list[str]:
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
-    prior = df.iloc[:-1]
-    if len(prior) < 60:
-        return []
-
-    resistance = prior["High"].tail(60).max()
-    flags: list[str] = []
-    is_breakout = latest["Close"] > resistance
-    if not is_breakout:
-        return flags
-
-    prev_resistance = df.iloc[:-2]["High"].tail(60).max()
-    if not (prev["Close"] > prev_resistance and latest["Close"] > resistance):
-        flags.append("저항선 상단에서 2거래일 연속 종가 안착이 아직 확인되지 않았습니다.")
-
-    recent_price_high = prior["Close"].tail(20).max()
-    recent_rsi_high = prior["RSI"].tail(20).max()
-    if latest["Close"] > recent_price_high and latest["RSI"] < recent_rsi_high:
-        flags.append("가격은 신고점을 만들었지만 RSI 고점은 낮아져 하락 다이버전스 위험이 있습니다.")
-
-    if latest["ATR_Ratio"] < 1.5:
-        flags.append("돌파 대비 ATR 확장이 부족해 변동성 동력이 약합니다.")
-
-    if abs(latest["Close"] - latest["VWAP_20"]) > 1.2 * latest["ATR_14"]:
-        flags.append("VWAP20 대비 이격이 1.2 ATR을 초과해 고무줄 되돌림 위험이 큽니다.")
-
-    return flags
-
-
-def detect_kill_switch(
-    df: pd.DataFrame,
-    benchmark_frame: pd.DataFrame | None,
-    vix_frame: pd.DataFrame | None,
-) -> list[str]:
-    triggers: list[str] = []
-    latest = df.iloc[-1]
-    if latest["Realized_Vol_5D"] > 0.07:
-        triggers.append("종목 5일 실현 변동성이 7%를 초과했습니다.")
-
-    if benchmark_frame is not None and not benchmark_frame.empty:
-        try:
-            benchmark = calculate_indicators(clean_price_frame(benchmark_frame)).dropna(subset=["EMA_200"])
-            if len(benchmark) > 0:
-                b = benchmark.iloc[-1]
-                if b["Close"] < b["EMA_200"]:
-                    triggers.append("벤치마크가 200일 EMA 아래에 있어 시장 방어 모드가 필요합니다.")
-        except Exception:
-            pass
-
-    if vix_frame is not None and not vix_frame.empty:
-        try:
-            vix = clean_price_frame(vix_frame)
-            vix_close = float(vix["Close"].iloc[-1])
-            if vix_close > 40:
-                triggers.append(f"VIX가 {vix_close:.1f}로 40을 초과했습니다.")
-        except Exception:
-            pass
-
-    return triggers
-
-
-def explain_signals(
-    latest: pd.Series,
-    prev: pd.Series,
-    regime: str,
-    false_breakout_flags: list[str],
-) -> tuple[list[str], list[str]]:
-    bullish: list[str] = []
-    bearish: list[str] = []
-
-    if latest["EMA_10"] > latest["EMA_50"]:
-        bullish.append("EMA10이 EMA50 위에 있어 중기 추세가 우호적입니다.")
-    else:
-        bearish.append("EMA10이 EMA50 아래에 있어 추세 확인이 약합니다.")
-
-    if latest["MACD"] > latest["MACD_Signal"]:
-        bullish.append("MACD가 시그널선 위에 있어 모멘텀이 개선 중입니다.")
-    else:
-        bearish.append("MACD가 시그널선 아래에 있어 상승 모멘텀이 부족합니다.")
-
-    if 35 <= latest["RSI"] <= 65:
-        bullish.append("RSI가 과열/과매도 극단을 벗어난 안정 구간입니다.")
-    elif latest["RSI"] > 70:
-        bearish.append("RSI가 과매수권이라 신규 추격 매수는 보수적으로 봐야 합니다.")
-    elif latest["RSI"] < 30:
-        bearish.append("RSI가 과매도권이지만 아직 탈출 확인이 필요합니다.")
-
-    if latest["Volume_Ratio"] > 1.5:
-        bullish.append("거래량이 20일 평균의 1.5배를 넘어 수급 확인이 강합니다.")
-    else:
-        bearish.append("거래량 필터가 아직 강한 수급 유입을 확인하지 못했습니다.")
-
-    if latest["Close"] > latest["VWAP_20"]:
-        bullish.append("종가가 VWAP20 위에 있어 평균 매입 단가 대비 우위가 있습니다.")
-    else:
-        bearish.append("종가가 VWAP20 아래라 매수세 장악력이 약합니다.")
-
-    if "변동성 급증" in regime:
-        bearish.append("변동성 급증 국면이라 포지션 크기와 손절 폭을 줄여야 합니다.")
-    if false_breakout_flags:
-        bearish.append("돌파 신호에 가짜 돌파 의심 조건이 붙었습니다.")
-
-    return bullish[:4], bearish[:5]
-
-
-def composite_score(
-    latest: pd.Series,
-    prev: pd.Series,
-    filters: list[FilterResult],
-    false_breakout_flags: list[str],
-    kill_switch: list[str],
-) -> int:
-    score = 0.0
-
-    if latest["Close"] > latest["EMA_50"]:
-        score += 12
-    if latest["EMA_10"] > latest["EMA_50"]:
-        score += 13
-    if latest["ADX_14"] > 20:
-        score += 10
-    if latest["MACD"] > latest["MACD_Signal"]:
-        score += 15
-    if prev["RSI"] <= 30 < latest["RSI"]:
-        score += 12
-    elif 35 <= latest["RSI"] <= 65:
-        score += 10
-    elif latest["RSI"] > 75:
-        score -= 8
-    if latest["Close"] > latest["VWAP_20"]:
-        score += 10
-    if latest["Volume_Ratio"] > 1.5:
-        score += 13
-    elif latest["Volume_Ratio"] > 1.0:
-        score += 6
-    if latest["Close"] > latest["BB_Middle"]:
-        score += 5
-    if latest["ATR_Ratio"] > 1.5:
-        score -= 10
-
-    score += 5 * sum(1 for item in filters if item.passed)
-    score -= 8 * len(false_breakout_flags)
-    score -= 20 * len(kill_switch)
-    return int(max(0, min(100, round(score))))
-
-
-def build_risk_levels(df: pd.DataFrame) -> dict[str, float]:
-    latest = df.iloc[-1]
-    recent_high = float(df["High"].tail(20).max())
-    recent_low = float(df["Low"].tail(20).min())
-    close = float(latest["Close"])
-    atr_value = float(latest["ATR_14"])
-    initial_stop = close - (2.0 * atr_value)
-    trailing_stop = max(initial_stop, recent_high - (2.0 * atr_value))
     return {
-        "close": close,
-        "initial_stop": initial_stop,
-        "trailing_stop": trailing_stop,
-        "risk_per_share": close - initial_stop,
-        "recent_support": recent_low,
-        "recent_resistance": recent_high,
-        "bollinger_upper": float(latest["BB_Upper"]),
-        "bollinger_lower": float(latest["BB_Lower"]),
+        "years": years,
+        "cagr_strategy": cagr_strategy,
+        "cagr_buy_hold": cagr_buy_hold,
+        "mdd_strategy": df["Strategy_Drawdown"].min(),
+        "mdd_buy_hold": df["Buy_Hold_Drawdown"].min(),
+        "cumulative_strategy": cumulative_strategy,
+        "cumulative_buy_hold": cumulative_buy_hold,
+        "annual_return": annual_return,
+        "annual_volatility": annual_volatility,
+        "kelly_fraction": kelly_fraction,
+        "suggested_fractional_kelly": max(0.0, min(kelly_fraction * 0.5, 1.0)),
+        "market_exposure": df["Invested"].mean(),
     }
 
 
-def decide_action(
-    score: int,
-    filters: list[FilterResult],
-    latest: pd.Series,
-    kill_switch: list[str],
-    false_breakout_flags: list[str],
-    risk_levels: dict[str, float],
-) -> str:
-    if kill_switch:
-        return "위험 회피: 신규 매수 금지 및 보유 포지션 축소/청산 검토"
-
-    all_filters_pass = all(item.passed for item in filters)
-    sell_pressure = (
-        latest["Close"] < risk_levels["trailing_stop"]
-        or (latest["Close"] < latest["EMA_50"] and latest["MACD"] < latest["MACD_Signal"])
-        or (latest["RSI"] > 75 and latest["Stoch_RSI_K"] < latest["Stoch_RSI_D"])
-    )
-    if sell_pressure:
-        return "매도/비중 축소 우선"
-    if all_filters_pass and score >= 70 and not false_breakout_flags:
-        return "매수 후보: 3단계 필터 통과"
-    if score >= 60 and not false_breakout_flags:
-        return "관심 후보: 분할 진입만 검토"
-    if score >= 45:
-        return "관망/보유: 추가 확인 필요"
-    return "신규 진입 보류"
+def decide_longterm_action(latest: pd.Series, prev: pd.Series) -> str:
+    if latest["Death_Cross"]:
+        return "전량 매도/현금화: EMA50이 SMA200 아래로 데드크로스"
+    if latest["Golden_Cross"]:
+        return "장기 매수 전환: EMA50이 SMA200 위로 골든크로스"
+    if not latest["Bull_Regime"]:
+        return "신규 매수 보류: 장기 약세장 필터 작동"
+    if latest["Close"] < latest["ATR_Trailing_Stop"]:
+        return "비중 축소/청산: ATR 장기 추적 손절선 이탈"
+    if prev["Close"] < prev["ATR_Trailing_Stop"] and latest["Close"] >= latest["ATR_Trailing_Stop"]:
+        return "재진입 후보: 장기 상승장 안에서 ATR 손절선 회복"
+    return "장기 보유 유지: 상승장 필터와 ATR 방어선 유지"
 
 
-def confidence_label(
-    score: int,
-    filters: list[FilterResult],
-    kill_switch: list[str],
-    false_breakout_flags: list[str],
-) -> str:
-    if kill_switch:
-        return "낮음"
-    passed = sum(1 for item in filters if item.passed)
-    if score >= 70 and passed == 3 and not false_breakout_flags:
+def classify_longterm_regime(latest: pd.Series) -> str:
+    if latest["Bull_Regime"] and latest["Close"] >= latest["ATR_Trailing_Stop"]:
+        return "장기 상승장/보유 국면"
+    if latest["Bull_Regime"]:
+        return "장기 상승장 안의 변동성 경고 국면"
+    return "장기 약세장/현금화 국면"
+
+
+def confidence_label(latest: pd.Series, metrics: dict[str, float]) -> str:
+    distance = latest["EMA_50"] / latest["SMA_200"] - 1.0
+    if latest["Bull_Regime"] and distance > 0.05 and metrics["market_exposure"] > 0.35:
         return "높음"
-    if score >= 50 and passed >= 2:
+    if abs(distance) <= 0.03:
         return "보통"
-    return "낮음"
+    return "낮음" if not latest["Bull_Regime"] else "보통"
 
 
-def latest_to_dict(latest: pd.Series) -> dict[str, float]:
-    fields = [
-        "Close",
-        "EMA_10",
-        "EMA_20",
-        "EMA_50",
-        "RSI",
-        "MACD",
-        "MACD_Signal",
-        "ADX_14",
-        "ATR_14",
-        "ATR_Ratio",
-        "VWAP_20",
-        "Volume_Ratio",
-        "BB_Upper",
-        "BB_Lower",
+def explain_longterm(
+    latest: pd.Series,
+    prev: pd.Series,
+    metrics: dict[str, float],
+    atr_multiplier: float,
+) -> tuple[list[str], list[str]]:
+    insights: list[str] = []
+    warnings: list[str] = [
+        "본 결과는 장기 추세 추종 백테스트 기반 참고용 분석이며 투자 조언이나 수익 보장을 의미하지 않습니다.",
+        "yfinance 데이터는 지연/누락될 수 있으므로 실제 주문 전 증권사/거래소 시세를 확인하세요.",
     ]
-    return {field: float(latest[field]) for field in fields}
+
+    if latest["EMA_50"] > latest["SMA_200"]:
+        insights.append("EMA50이 SMA200 위에 있어 장기 강세 필터가 켜져 있습니다.")
+    else:
+        warnings.append("EMA50이 SMA200 아래에 있어 장기 약세장 방어 모드입니다.")
+
+    if latest["Golden_Cross"]:
+        insights.append("오늘 기준 장기 골든크로스가 발생했습니다.")
+    if latest["Death_Cross"]:
+        warnings.append("오늘 기준 장기 데드크로스가 발생했습니다.")
+
+    stop_gap = latest["Close"] / latest["ATR_Trailing_Stop"] - 1.0
+    if latest["Close"] >= latest["ATR_Trailing_Stop"]:
+        insights.append(f"가격이 ATR {atr_multiplier:.1f}배 추적 손절선 위에 있습니다.")
+    else:
+        warnings.append(f"가격이 ATR {atr_multiplier:.1f}배 추적 손절선을 이탈했습니다.")
+
+    if metrics["cagr_strategy"] > metrics["cagr_buy_hold"]:
+        insights.append("해당 기간에는 장기 필터 전략 CAGR이 단순 보유보다 높았습니다.")
+    else:
+        warnings.append("해당 기간에는 단순 보유 CAGR이 장기 필터 전략보다 높았습니다.")
+
+    if metrics["mdd_strategy"] > metrics["mdd_buy_hold"]:
+        insights.append("장기 필터 전략의 최대 낙폭이 단순 보유보다 작았습니다.")
+    else:
+        warnings.append("장기 필터 전략의 최대 낙폭 축소 효과가 제한적이었습니다.")
+
+    if abs(stop_gap) < 0.05 and latest["Bull_Regime"]:
+        warnings.append("현재가가 추적 손절선과 5% 이내로 가까워 방어선 테스트 구간입니다.")
+
+    if metrics["kelly_fraction"] <= 0:
+        warnings.append("장기 켈리 비중이 0 이하로 계산되어 기대수익 대비 변동성이 불리합니다.")
+    elif metrics["kelly_fraction"] > 1:
+        warnings.append("장기 켈리 비중이 100%를 초과하므로 실전에서는 분수 켈리로 제한하는 편이 안전합니다.")
+
+    return insights[:5], warnings
 
 
-def format_telegram_report(result: AnalysisResult) -> str:
-    filter_lines = "\n".join(
-        f"- {item.name}: {'PASS' if item.passed else 'FAIL'} | {item.detail}" for item in result.filters
-    )
-    bullish = "\n".join(f"- {item}" for item in result.bullish_points) or "- 뚜렷한 강세 근거가 부족합니다."
-    bearish = "\n".join(f"- {item}" for item in result.bearish_points) or "- 뚜렷한 약세 근거가 제한적입니다."
-    kill = "\n".join(f"- {item}" for item in result.kill_switch) or "- 감지된 킬스위치 조건 없음"
-    breakout = "\n".join(f"- {item}" for item in result.false_breakout_flags) or "- 가짜 돌파 위험 신호 없음"
+def format_telegram_report(result: LongTermResult) -> str:
+    insights = "\n".join(f"- {item}" for item in result.insights) or "- 뚜렷한 장기 강세 근거가 제한적입니다."
     warnings = "\n".join(f"- {item}" for item in result.warnings)
 
-    latest = result.latest
-    risk = result.risk_levels
     return (
-        f"{result.ticker} 기술적 분석 ({result.as_of})\n\n"
+        f"{result.ticker} 장기 퀀트 분석 ({result.as_of})\n\n"
         f"판정: {result.action}\n"
-        f"신뢰도: {result.confidence} / 복합점수: {result.score}/100\n"
-        f"시장 국면: {result.regime}\n"
-        f"현재가: {fmt(latest['Close'])}\n\n"
-        "3단계 필터\n"
-        f"{filter_lines}\n\n"
-        "핵심 강세 근거\n"
-        f"{bullish}\n\n"
-        "주의/약세 근거\n"
-        f"{bearish}\n\n"
-        "리스크 가격대\n"
-        f"- 초기 손절 기준: {fmt(risk['initial_stop'])} (약 2 ATR)\n"
-        f"- 추적 손절 기준: {fmt(risk['trailing_stop'])}\n"
-        f"- 최근 지지/저항: {fmt(risk['recent_support'])} / {fmt(risk['recent_resistance'])}\n"
-        f"- 볼린저 하단/상단: {fmt(risk['bollinger_lower'])} / {fmt(risk['bollinger_upper'])}\n\n"
-        "가짜 돌파 점검\n"
-        f"{breakout}\n\n"
-        "킬스위치 점검\n"
-        f"{kill}\n\n"
+        f"신뢰도: {result.confidence}\n"
+        f"국면: {result.regime}\n"
+        f"분석 기간: {result.start_date} ~ {result.as_of} / {result.rows:,}거래일\n\n"
+        "장기 추세 필터\n"
+        f"- 현재가: {fmt(result.current_price)}\n"
+        f"- EMA50: {fmt(result.ema50)}\n"
+        f"- SMA200: {fmt(result.sma200)}\n"
+        f"- 상태: {'보유 가능' if result.invested_now else '현금/관망'}\n\n"
+        "ATR 장기 추적 손절\n"
+        f"- ATR14: {fmt(result.atr14)}\n"
+        f"- 승수: {result.atr_multiplier:.1f}x\n"
+        f"- 초기 손절 참고선: {fmt(result.initial_stop)}\n"
+        f"- 추적 손절선: {fmt(result.trailing_stop)}\n\n"
+        "40년형 백테스트 요약\n"
+        f"- 전략 CAGR: {pct(result.cagr_strategy)} / 단순보유 CAGR: {pct(result.cagr_buy_hold)}\n"
+        f"- 전략 MDD: {pct(result.mdd_strategy)} / 단순보유 MDD: {pct(result.mdd_buy_hold)}\n"
+        f"- 전략 누적배수: {result.cumulative_strategy:.2f}x / 단순보유 누적배수: {result.cumulative_buy_hold:.2f}x\n"
+        f"- 시장 노출 비율: {pct(result.market_exposure)}\n\n"
+        "장기 켈리 자산 배분\n"
+        f"- 연환산 기대수익률 μ: {pct(result.annual_return)}\n"
+        f"- 연환산 변동성 σ: {pct(result.annual_volatility)}\n"
+        f"- 무위험 이자율 r: {pct(result.risk_free_rate)}\n"
+        f"- 켈리 비중 f*: {pct(result.kelly_fraction)}\n"
+        f"- 실전 참고 분수 켈리(0~100% 제한): {pct(result.suggested_fractional_kelly)}\n\n"
+        "핵심 해석\n"
+        f"{insights}\n\n"
         "주의\n"
         f"{warnings}"
     )
@@ -565,21 +371,24 @@ def fmt(value: Any) -> str:
     return f"{number:,.4f}"
 
 
+def pct(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if np.isnan(number) or np.isinf(number):
+        return "N/A"
+    return f"{number * 100:,.2f}%"
+
+
 def format_date(value: Any) -> str:
     if hasattr(value, "date"):
         return str(value.date())
     return str(value)
 
 
-def max_period(period: str, minimum: str) -> str:
-    order = {
-        "1mo": 1,
-        "3mo": 3,
-        "6mo": 6,
-        "1y": 12,
-        "2y": 24,
-        "5y": 60,
-        "10y": 120,
-        "max": 9999,
-    }
-    return period if order.get(period, 12) >= order.get(minimum, 12) else minimum
+def normalize_longterm_period(period: str) -> str:
+    normalized = (period or "max").lower()
+    if normalized in {"5y", "10y", "max"}:
+        return normalized
+    return "max"

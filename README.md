@@ -1,27 +1,21 @@
-# Telegram Stock Analyzer Bot
+# Telegram Long-Term Quant Analyzer
 
-텔레그램에 티커를 보내면 첨부 텍스트의 분석 프레임워크를 바탕으로 주가를 분석해 답변하는 파이썬 봇입니다.
+텔레그램에 티커를 보내면 장기 투자 관점의 퀀트 분석을 GitHub Actions 또는 로컬 봇으로 돌려 답장하는 앱입니다. 별도 Streamlit 대시보드 `longterm_app.py`로 1986년 이후 장기 백테스트도 확인할 수 있습니다.
 
-구현된 분석 기준:
+## 핵심 전략
 
-- 시장 국면 분류: 강한 상승/하락 추세, 박스권, 변동성 급증
-- 핵심 지표: EMA10/20/50/200, ADX, RSI, MACD, Bollinger Bands, ATR, VWAP20, 거래량 평균
-- 3단계 필터: 추세 확인 -> 모멘텀 확인 -> 거래량/유동성 확인
-- 가짜 돌파 필터: 2거래일 종가 안착, RSI 다이버전스, ATR 확장, VWAP 이격
-- 매도/리스크: ATR 기반 초기 손절, 추적 손절, 과매수/추세 둔화 경고
-- 킬스위치: 벤치마크 200일 EMA 이탈, VIX 40 초과, 5일 변동성 급등
+- 장기 추세 필터: 50일 EMA와 200일 SMA
+- 매수/보유: EMA50이 SMA200 위에 있는 장기 강세장
+- 매도/현금화: EMA50이 SMA200 아래로 내려가는 데드크로스
+- 노이즈 차단 손절: ATR14의 3.0x~4.0x 장기 추적 손절
+- 성과 분석: CAGR, MDD, 단순 보유 대비 누적 성과
+- 장기 켈리 비중: `f* = (mu - r) / sigma^2`
 
-## 준비
+## 텔레그램 봇 실행
 
 1. Telegram에서 `@BotFather`에게 `/newbot`을 보내 봇을 만들고 토큰을 받습니다.
-2. Python 3.10 이상을 설치합니다.
-3. 이 폴더로 이동합니다.
-
-```powershell
-cd C:\Users\juns3\Documents\Codex\2026-05-31\files-mentioned-by-the-user-txt\outputs\telegram-stock-analyzer
-```
-
-4. 가상환경을 만들고 패키지를 설치합니다.
+2. Python 3.10 이상을 준비합니다.
+3. 이 폴더에서 패키지를 설치합니다.
 
 ```powershell
 py -3.11 -m venv .venv
@@ -30,80 +24,97 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-5. `.env.example`을 `.env`로 복사한 뒤 `TELEGRAM_BOT_TOKEN`을 입력합니다.
+4. `.env.example`을 `.env`로 복사한 뒤 토큰을 입력합니다.
 
 ```powershell
 Copy-Item .env.example .env
 notepad .env
 ```
 
-## 실행
+5. 실행합니다.
 
 ```powershell
 python bot.py
 ```
 
-텔레그램에서 봇에게 아래처럼 보내면 됩니다.
+텔레그램 예시:
 
 ```text
 AAPL
-TSLA 2y
-/analyze NVDA 1y
+TSLA
+/analyze NVDA
 005930.KS
-035420.KQ
+/chatid
 ```
 
-## 선택 설정
-
-`.env`에서 아래 값을 바꿀 수 있습니다.
-
-```dotenv
-DEFAULT_PERIOD=1y
-BENCHMARK_TICKER=SPY
-ALLOWED_CHAT_IDS=
-```
-
-`ALLOWED_CHAT_IDS`에 숫자 chat id를 쉼표로 넣으면 해당 채팅만 봇을 사용할 수 있습니다. 비워두면 봇에 접근 가능한 모든 채팅에서 사용할 수 있습니다.
+한국 종목은 yfinance 표기처럼 `.KS` 또는 `.KQ`를 붙여 보내세요.
 
 ## GitHub Actions로 실행
 
-로컬 PC를 켜두지 않고 GitHub Actions가 텔레그램 메시지를 확인하고 답장하게 만들 수 있습니다. 단, GitHub Actions는 상시 실행 서버가 아니므로 실시간 응답이 아니라 5분 안팎의 폴링 방식입니다.
+로컬 PC를 켜두지 않고 GitHub Actions가 텔레그램 메시지를 확인하고 답장하게 만들 수 있습니다. 단, Actions는 상시 서버가 아니므로 보통 5분 안팎의 폴링 방식입니다.
 
-1. 이 폴더의 파일들을 GitHub 저장소 루트에 올립니다.
-2. GitHub 저장소에서 `Settings` -> `Secrets and variables` -> `Actions`로 이동합니다.
-3. `Secrets`에 아래 값을 추가합니다.
+정상 파일 구조:
+
+```text
+repository-root/
+  .github/
+    workflows/
+      telegram-stock-analyzer.yml
+  bot.py
+  github_action_poll.py
+  longterm_app.py
+  request_parser.py
+  stock_analyzer.py
+  requirements.txt
+```
+
+GitHub 저장소에서 `Settings` -> `Secrets and variables` -> `Actions`로 이동한 뒤 `Secrets`에 추가합니다.
 
 ```text
 TELEGRAM_BOT_TOKEN=BotFather에서 받은 봇 토큰
 ALLOWED_CHAT_IDS=내 텔레그램 chat id
 ```
 
-4. `Variables`에는 선택값을 추가할 수 있습니다.
+선택값은 `Variables`에 넣을 수 있습니다.
 
 ```text
-DEFAULT_PERIOD=1y
+DEFAULT_PERIOD=max
 BENCHMARK_TICKER=SPY
 ```
 
-5. `Actions` 탭에서 `Telegram Stock Analyzer` 워크플로를 활성화하고 `Run workflow`로 한 번 수동 실행합니다.
-6. 이후 텔레그램에서 봇에게 `AAPL`, `TSLA 2y`, `005930.KS`처럼 보내면 Actions가 정기 실행될 때 답장합니다.
+`Actions` 탭에서 `Telegram Stock Analyzer` 워크플로를 `Run workflow`로 한 번 실행하세요. 이후 텔레그램에 티커를 보내면 다음 스케줄 실행 때 답장합니다.
 
-주의: 로컬에서 `python bot.py`를 동시에 실행하지 마세요. Telegram `getUpdates` 폴링은 한쪽이 메시지를 먼저 가져가면 다른 쪽이 같은 메시지를 못 받을 수 있습니다.
+## Chat ID 확인
 
-### Telegram 토큰과 방 번호 확인
+가장 확실한 방법은 봇에게 아래 명령을 보내는 것입니다.
 
-- `TELEGRAM_BOT_TOKEN`: Telegram의 `@BotFather`에게 `/newbot`으로 봇을 만든 뒤 받은 토큰입니다. GitHub에는 코드나 `.env`가 아니라 반드시 `Repository secrets`에 넣습니다.
-- `ALLOWED_CHAT_IDS`: 봇에게 아무 메시지나 보낸 뒤 브라우저에서 `https://api.telegram.org/bot<토큰>/getUpdates`를 열면 `chat.id` 숫자가 나옵니다. 개인 채팅은 보통 양수, 그룹/채널은 보통 음수입니다.
+```text
+/chatid
+```
 
-그룹방에서 쓸 때는 봇을 그룹에 초대하고 `/analyze AAPL`처럼 명령어로 호출하는 편이 안전합니다. 일반 텍스트 `AAPL`까지 그룹에서 읽게 하려면 `@BotFather`의 `/setprivacy`에서 해당 봇의 privacy mode를 끄세요.
+GitHub Actions 방식이면 `Run workflow`를 눌러야 바로 답장을 받습니다. 답장에 나온 숫자를 그대로 `ALLOWED_CHAT_IDS`에 넣으세요. 개인 채팅과 그룹방의 chat id는 다르며, 그룹방은 보통 `-100...` 같은 음수입니다.
 
-`이 봇을 사용할 권한이 없는 채팅입니다`가 뜨면 토큰 문제가 아니라 `ALLOWED_CHAT_IDS` 값이 현재 채팅방의 `chat.id`와 다르다는 뜻입니다. 답장에 표시되는 `현재 chat id`를 그대로 GitHub Actions secret의 `ALLOWED_CHAT_IDS`에 넣고 다시 실행하세요.
+브라우저로 확인할 수도 있습니다.
 
-가장 확실한 확인 방법은 봇에게 `/chatid` 또는 `/id`를 보내는 것입니다. 이 명령은 `ALLOWED_CHAT_IDS`가 틀려도 현재 채팅방의 id를 답장하도록 되어 있습니다.
+```text
+https://api.telegram.org/bot<토큰>/getUpdates
+```
+
+응답의 `message.chat.id`가 방 번호입니다. `result: []`이면 Actions나 로컬 봇이 이미 메시지를 가져간 것이므로 새 메시지를 보낸 뒤 다시 확인하세요.
+
+## Streamlit 장기 백테스트
+
+로컬에서 대시보드를 실행하려면:
+
+```powershell
+streamlit run longterm_app.py
+```
+
+대시보드에서 티커, 시작일, ATR 승수, 무위험 이자율, 초기 자본을 바꾸며 40년형 장기 추세 전략을 확인할 수 있습니다.
 
 ## 테스트
 
-인터넷 없이 분석 로직만 간단히 확인하려면 다음을 실행하세요.
+인터넷 없이 계산 로직만 확인하려면:
 
 ```powershell
 python test_smoke.py
@@ -111,4 +122,4 @@ python test_smoke.py
 
 ## 주의
 
-이 봇은 기술적 지표 기반의 참고용 분석 도구입니다. 실제 매수/매도 주문을 자동 실행하지 않으며, 투자 조언이나 수익 보장을 의미하지 않습니다. yfinance 데이터는 지연되거나 누락될 수 있으므로 실제 주문 전 증권사/거래소 시세를 반드시 확인하세요.
+이 앱은 장기 추세 추종 전략의 연구/검증용 도구입니다. 실제 매수/매도 주문을 자동 실행하지 않으며, 투자 조언이나 수익 보장을 의미하지 않습니다. yfinance 데이터는 지연되거나 누락될 수 있으므로 실제 주문 전 증권사/거래소 시세를 반드시 확인하세요.

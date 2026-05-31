@@ -21,12 +21,14 @@ def allowed_chat_ids() -> set[int]:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "티커를 보내면 기술적 지표 기반으로 매수/매도 판단을 분석합니다.\n\n"
+        "티커를 보내면 장기 투자용 EMA50/SMA200 추세 필터, ATR 3.5배 추적 손절, "
+        "40년형 백테스트, 장기 켈리 비중을 분석합니다.\n\n"
         "예시:\n"
         "AAPL\n"
-        "TSLA 2y\n"
+        "TSLA\n"
         "005930.KS\n"
-        "/analyze NVDA 1y\n\n"
+        "/analyze NVDA\n"
+        "/chatid\n\n"
         "한국 종목은 yfinance 표기처럼 .KS 또는 .KQ를 붙여 보내세요."
     )
 

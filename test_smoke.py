@@ -10,7 +10,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 
-def make_sample_frame(rows: int = 260) -> pd.DataFrame:
+def make_sample_frame(rows: int = 800) -> pd.DataFrame:
     rng = np.random.default_rng(42)
     dates = pd.date_range("2025-01-01", periods=rows, freq="B")
     trend = np.linspace(100.0, 155.0, rows)
@@ -35,8 +35,8 @@ def make_sample_frame(rows: int = 260) -> pd.DataFrame:
 
 if __name__ == "__main__":
     frame = make_sample_frame()
-    result = analyze_price_frame("SAMPLE", frame, benchmark_frame=frame)
+    result = analyze_price_frame("SAMPLE", frame)
     report = format_telegram_report(result)
-    assert "SAMPLE 기술적 분석" in report
-    assert result.rows > 60
+    assert "SAMPLE 장기 퀀트 분석" in report
+    assert result.rows > 220
     print(report)

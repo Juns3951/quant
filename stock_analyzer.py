@@ -181,7 +181,7 @@ def calculate_longterm_backtest(
     out["ATR_14"] = atr(out["High"], out["Low"], close)
 
     out["Bull_Regime"] = out["EMA_50"] > out["SMA_200"]
-    prev_bull = out["Bull_Regime"].shift(1).fillna(False)
+    prev_bull = out["Bull_Regime"].shift(1, fill_value=False).astype(bool)
     out["Golden_Cross"] = out["Bull_Regime"] & ~prev_bull
     out["Death_Cross"] = ~out["Bull_Regime"] & prev_bull
 

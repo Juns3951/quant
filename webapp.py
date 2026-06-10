@@ -1,0 +1,395 @@
+from __future__ import annotations
+
+import base64
+import math
+import os
+from typing import Any
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+
+from chart_generator import generate_backtest_chart
+from stock_analyzer import AnalyzerError, analyze_ticker, pct, _fmt_ratio, _fmt_days
+
+app = FastAPI(title="Long-Term Quant Analyzer")
+
+
+class AnalyzeRequest(BaseModel):
+    ticker: str
+    period: str = "max"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    return HTMLResponse(HTML)
+
+
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest) -> JSONResponse:
+    ticker = req.ticker.strip().upper()
+    if not ticker:
+        return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
+
+    try:
+        result = analyze_ticker(ticker, req.period)
+    except AnalyzerError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": f"분석 오류: {exc}"}, status_code=500)
+
+    chart_bytes = generate_backtest_chart(result)
+    chart_b64 = base64.b64encode(chart_bytes).decode() if chart_bytes else None
+
+    pf = result.profit_factor
+    pf_str = "∞" if math.isinf(pf) and pf > 0 else _fmt_ratio(pf)
+
+    trades_data: list[dict[str, Any]] = []
+    if result.trades is not None and not result.trades.empty:
+        for _, row in result.trades.iterrows():
+            trades_data.append({
+                "entry_date": str(row["Entry Date"]),
+                "entry_price": row["Entry Price"],
+                "exit_date": str(row["Exit Date"]),
+                "exit_price": row["Exit Price"],
+                "return_pct": round(row["Return"] * 100, 2),
+                "holding_days": int(row["Holding Days"]),
+                "exit_reason": row["Exit Reason"],
+            })
+
+    return JSONResponse({
+        "ticker": result.ticker,
+        "as_of": result.as_of,
+        "start_date": result.start_date,
+        "rows": result.rows,
+        "action": result.action,
+        "regime": result.regime,
+        "confidence": result.confidence,
+        "invested_now": result.invested_now,
+        "metrics": {
+            "current_price": result.current_price,
+            "ema50": result.ema50,
+            "sma200": result.sma200,
+            "atr_stop": result.trailing_stop,
+            "cagr_strategy": pct(result.cagr_strategy),
+            "cagr_buy_hold": pct(result.cagr_buy_hold),
+            "mdd_strategy": pct(result.mdd_strategy),
+            "mdd_buy_hold": pct(result.mdd_buy_hold),
+            "cumulative_strategy": f"{result.cumulative_strategy:.2f}x",
+            "market_exposure": pct(result.market_exposure),
+            "sharpe": _fmt_ratio(result.sharpe_ratio),
+            "sortino": _fmt_ratio(result.sortino_ratio),
+            "win_rate": pct(result.win_rate),
+            "profit_factor": pf_str,
+            "num_trades": result.num_trades,
+            "avg_holding": _fmt_days(result.avg_holding_days),
+            "best_trade": pct(result.best_trade),
+            "worst_trade": pct(result.worst_trade),
+            "kelly": pct(result.kelly_fraction),
+            "fractional_kelly": pct(result.suggested_fractional_kelly),
+        },
+        "insights": result.insights,
+        "warnings": result.warnings,
+        "trades": trades_data,
+        "chart": chart_b64,
+    })
+
+
+HTML = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Long-Term Quant</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --orange: #f0883e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+  .container { max-width: 700px; margin: 0 auto; padding: 16px; }
+
+  header { text-align: center; padding: 24px 0 20px; }
+  header h1 { font-size: 1.3rem; font-weight: 700; color: var(--accent); }
+  header p { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
+
+  .search-box { display: flex; gap: 8px; margin-bottom: 20px; }
+  .search-box input {
+    flex: 1; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 12px 14px;
+    font-size: 1rem; outline: none; text-transform: uppercase;
+  }
+  .search-box input::placeholder { text-transform: none; color: var(--muted); }
+  .search-box input:focus { border-color: var(--accent); }
+  .search-box button {
+    background: var(--accent); color: #0d1117; border: none;
+    border-radius: 8px; padding: 12px 20px; font-size: 0.95rem;
+    font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  .search-box button:disabled { opacity: 0.5; cursor: default; }
+
+  .spinner { display: none; text-align: center; padding: 40px; color: var(--muted); font-size: 0.9rem; }
+  .spinner.active { display: block; }
+
+  .error-box { background: #2d1b1b; border: 1px solid var(--red); border-radius: 8px; padding: 14px; color: var(--red); font-size: 0.9rem; margin-bottom: 16px; display: none; }
+  .error-box.active { display: block; }
+
+  #result { display: none; }
+  #result.active { display: block; }
+
+  .result-header { margin-bottom: 16px; }
+  .result-header .ticker-name { font-size: 1.4rem; font-weight: 700; }
+  .result-header .meta { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+  .action-badge {
+    display: inline-block; margin-top: 8px; padding: 6px 12px;
+    border-radius: 20px; font-size: 0.82rem; font-weight: 600;
+  }
+  .action-badge.bull { background: #1a3a2a; color: var(--green); border: 1px solid var(--green); }
+  .action-badge.bear { background: #2d1b1b; color: var(--red); border: 1px solid var(--red); }
+  .action-badge.hold { background: #1a2a3a; color: var(--accent); border: 1px solid var(--accent); }
+
+  .section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+  .section-title { font-size: 0.78rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+
+  .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .metric { background: var(--bg); border-radius: 8px; padding: 10px 12px; }
+  .metric .label { font-size: 0.72rem; color: var(--muted); margin-bottom: 3px; }
+  .metric .value { font-size: 1.05rem; font-weight: 700; }
+  .value.positive { color: var(--green); }
+  .value.negative { color: var(--red); }
+  .value.neutral { color: var(--accent); }
+
+  .chart-wrap { margin-bottom: 12px; }
+  .chart-wrap img { width: 100%; border-radius: 10px; display: block; }
+
+  .trades-table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+  .trades-table th { color: var(--muted); font-weight: 500; padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+  .trades-table td { padding: 7px 8px; border-bottom: 1px solid #21262d; }
+  .trades-table tr:last-child td { border-bottom: none; }
+  .ret-pos { color: var(--green); font-weight: 600; }
+  .ret-neg { color: var(--red); font-weight: 600; }
+
+  .insights { list-style: none; }
+  .insights li { font-size: 0.83rem; padding: 5px 0; border-bottom: 1px solid #21262d; color: var(--text); }
+  .insights li:last-child { border-bottom: none; }
+  .insights li::before { content: "✦ "; color: var(--accent); font-size: 0.7rem; }
+  .warn li::before { color: var(--orange); }
+
+  .tag { display: inline-block; font-size: 0.7rem; padding: 2px 7px; border-radius: 10px; margin-left: 4px; vertical-align: middle; }
+  .tag.bull { background: #1a3a2a; color: var(--green); }
+  .tag.bear { background: #2d1b1b; color: var(--red); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Long-Term Quant</h1>
+    <p>EMA50/SMA200 + ATR 추적손절 전략 백테스트</p>
+  </header>
+
+  <div class="search-box">
+    <input id="tickerInput" type="text" placeholder="티커 입력 (예: AAPL, 005930.KS)" autocomplete="off" autocorrect="off" spellcheck="false">
+    <button id="analyzeBtn" onclick="runAnalysis()">분석</button>
+  </div>
+
+  <div id="errorBox" class="error-box"></div>
+  <div id="spinner" class="spinner">⏳ 데이터 수집 중... (최대 30초)</div>
+
+  <div id="result">
+    <div class="result-header">
+      <div>
+        <span class="ticker-name" id="rTicker"></span>
+        <span id="rInvestedTag"></span>
+      </div>
+      <div class="meta" id="rMeta"></div>
+      <div id="rAction" class="action-badge"></div>
+    </div>
+
+    <div class="chart-wrap" id="chartWrap" style="display:none">
+      <img id="chartImg" src="" alt="backtest chart">
+    </div>
+
+    <div class="section">
+      <div class="section-title">백테스트 성과</div>
+      <div class="metrics-grid">
+        <div class="metric"><div class="label">전략 CAGR</div><div class="value" id="mCagr"></div></div>
+        <div class="metric"><div class="label">B&H CAGR</div><div class="value neutral" id="mCagrBh"></div></div>
+        <div class="metric"><div class="label">전략 MDD</div><div class="value" id="mMdd"></div></div>
+        <div class="metric"><div class="label">누적 수익</div><div class="value" id="mCumul"></div></div>
+        <div class="metric"><div class="label">Sharpe</div><div class="value neutral" id="mSharpe"></div></div>
+        <div class="metric"><div class="label">Sortino</div><div class="value neutral" id="mSortino"></div></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">트레이드 통계</div>
+      <div class="metrics-grid">
+        <div class="metric"><div class="label">총 거래 수</div><div class="value neutral" id="mTrades"></div></div>
+        <div class="metric"><div class="label">승률</div><div class="value" id="mWinRate"></div></div>
+        <div class="metric"><div class="label">Profit Factor</div><div class="value" id="mPF"></div></div>
+        <div class="metric"><div class="label">평균 보유</div><div class="value neutral" id="mAvgHold"></div></div>
+        <div class="metric"><div class="label">최고 거래</div><div class="value positive" id="mBest"></div></div>
+        <div class="metric"><div class="label">최저 거래</div><div class="value negative" id="mWorst"></div></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">현재 수준</div>
+      <div class="metrics-grid">
+        <div class="metric"><div class="label">현재가</div><div class="value neutral" id="mPrice"></div></div>
+        <div class="metric"><div class="label">ATR 손절선</div><div class="value" id="mStop"></div></div>
+        <div class="metric"><div class="label">EMA50</div><div class="value neutral" id="mEma"></div></div>
+        <div class="metric"><div class="label">SMA200</div><div class="value neutral" id="mSma"></div></div>
+        <div class="metric"><div class="label">시장 노출</div><div class="value neutral" id="mExposure"></div></div>
+        <div class="metric"><div class="label">Kelly f*</div><div class="value neutral" id="mKelly"></div></div>
+      </div>
+    </div>
+
+    <div class="section" id="tradesSection" style="display:none">
+      <div class="section-title">거래 내역</div>
+      <div style="overflow-x:auto">
+        <table class="trades-table">
+          <thead><tr><th>진입</th><th>청산</th><th>수익률</th><th>보유</th><th>이유</th></tr></thead>
+          <tbody id="tradesBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">핵심 해석</div>
+      <ul class="insights" id="insightsList"></ul>
+    </div>
+
+    <div class="section">
+      <div class="section-title">주의</div>
+      <ul class="insights warn" id="warnList"></ul>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function colorClass(val) {
+  const n = parseFloat(val);
+  if (isNaN(n)) return '';
+  return n >= 0 ? 'positive' : 'negative';
+}
+
+async function runAnalysis() {
+  const ticker = $('tickerInput').value.trim().toUpperCase();
+  if (!ticker) { $('tickerInput').focus(); return; }
+
+  $('analyzeBtn').disabled = true;
+  $('spinner').classList.add('active');
+  $('errorBox').classList.remove('active');
+  $('result').classList.remove('active');
+
+  try {
+    const resp = await fetch('/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker, period: 'max' }),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      $('errorBox').textContent = data.error;
+      $('errorBox').classList.add('active');
+      return;
+    }
+
+    render(data);
+    $('result').classList.add('active');
+  } catch(e) {
+    $('errorBox').textContent = '네트워크 오류가 발생했습니다.';
+    $('errorBox').classList.add('active');
+  } finally {
+    $('spinner').classList.remove('active');
+    $('analyzeBtn').disabled = false;
+  }
+}
+
+function render(d) {
+  const m = d.metrics;
+  $('rTicker').textContent = d.ticker;
+  $('rInvestedTag').innerHTML = d.invested_now
+    ? '<span class="tag bull">보유 중</span>'
+    : '<span class="tag bear">현금</span>';
+  $('rMeta').textContent = `${d.start_date} ~ ${d.as_of} | ${d.rows.toLocaleString()}거래일 | 신뢰도: ${d.confidence}`;
+
+  const act = $('rAction');
+  act.textContent = d.action;
+  act.className = 'action-badge ' + (d.invested_now ? 'bull' : d.action.includes('매수') ? 'bull' : d.action.includes('매도') || d.action.includes('청산') ? 'bear' : 'hold');
+
+  if (d.chart) {
+    $('chartImg').src = 'data:image/png;base64,' + d.chart;
+    $('chartWrap').style.display = 'block';
+  }
+
+  function setMetric(id, val, forceClass) {
+    const el = $(id);
+    el.textContent = val;
+    if (forceClass) el.className = 'value ' + forceClass;
+    else el.className = 'value ' + colorClass(val);
+  }
+
+  setMetric('mCagr', m.cagr_strategy);
+  setMetric('mCagrBh', m.cagr_buy_hold, 'neutral');
+  setMetric('mMdd', m.mdd_strategy, 'negative');
+  setMetric('mCumul', m.cumulative_strategy, 'neutral');
+  setMetric('mSharpe', m.sharpe, 'neutral');
+  setMetric('mSortino', m.sortino, 'neutral');
+  $('mTrades').textContent = m.num_trades + '회';
+  setMetric('mWinRate', m.win_rate);
+  setMetric('mPF', m.profit_factor, parseFloat(m.profit_factor) >= 1 ? 'positive' : 'negative');
+  $('mAvgHold').textContent = m.avg_holding;
+  $('mBest').textContent = m.best_trade;
+  $('mWorst').textContent = m.worst_trade;
+
+  const fmt = n => n >= 100 ? n.toLocaleString('en', {maximumFractionDigits:2}) : n.toFixed(2);
+  $('mPrice').textContent = fmt(m.current_price);
+  $('mStop').textContent = fmt(m.atr_stop);
+  $('mEma').textContent = fmt(m.ema50);
+  $('mSma').textContent = fmt(m.sma200);
+  $('mExposure').textContent = m.market_exposure;
+  $('mKelly').textContent = m.fractional_kelly;
+
+  const body = $('tradesBody');
+  body.innerHTML = '';
+  if (d.trades && d.trades.length > 0) {
+    d.trades.slice().reverse().forEach(t => {
+      const cls = t.return_pct >= 0 ? 'ret-pos' : 'ret-neg';
+      const sign = t.return_pct >= 0 ? '+' : '';
+      body.innerHTML += `<tr>
+        <td>${t.entry_date}</td>
+        <td>${t.exit_date}</td>
+        <td class="${cls}">${sign}${t.return_pct}%</td>
+        <td>${t.holding_days}일</td>
+        <td>${t.exit_reason}</td>
+      </tr>`;
+    });
+    $('tradesSection').style.display = 'block';
+  } else {
+    $('tradesSection').style.display = 'none';
+  }
+
+  const iList = $('insightsList');
+  iList.innerHTML = d.insights.map(i => `<li>${i}</li>`).join('');
+
+  const wList = $('warnList');
+  wList.innerHTML = d.warnings.map(w => `<li>${w}</li>`).join('');
+}
+
+$('tickerInput').addEventListener('keydown', e => { if (e.key === 'Enter') runAnalysis(); });
+</script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("webapp:app", host="0.0.0.0", port=port, reload=False)

@@ -39,4 +39,10 @@ if __name__ == "__main__":
     report = format_telegram_report(result)
     assert "SAMPLE 장기 퀀트 분석" in report
     assert result.rows > 220
+    assert result.trades is not None
+    assert result.num_trades >= 0
+    if result.num_trades > 0:
+        assert {"Entry Date", "Exit Date", "Return", "Exit Reason"}.issubset(result.trades.columns)
+        assert 0.0 <= result.win_rate <= 1.0
+        assert "트레이드별 성과" in report
     print(report)

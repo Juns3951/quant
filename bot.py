@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 
@@ -8,6 +9,7 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
+from chart_generator import generate_backtest_chart
 from request_parser import TICKER_RE, parse_request
 from stock_analyzer import AnalyzerError, analyze_ticker, format_telegram_report
 
@@ -77,6 +79,13 @@ async def run_analysis(update: Update, raw_text: str) -> None:
         result = await asyncio.to_thread(analyze_ticker, ticker, period, benchmark)
         report = format_telegram_report(result)
         await waiting_message.edit_text(report[:3900])
+
+        chart_bytes = await asyncio.to_thread(generate_backtest_chart, result)
+        if chart_bytes:
+            await update.message.reply_photo(
+                photo=io.BytesIO(chart_bytes),
+                caption=f"{result.ticker} 백테스트 차트",
+            )
     except AnalyzerError as exc:
         await waiting_message.edit_text(str(exc))
     except Exception:

@@ -46,12 +46,14 @@ if run or ticker:
         st.subheader(f"{result.ticker} 장기 퀀트 분석")
         st.caption(f"{result.start_date} ~ {result.as_of} / {result.rows:,} trading days")
 
-        cols = st.columns(5)
+        cols = st.columns(7)
         cols[0].metric("Signal", result.action)
         cols[1].metric("Strategy CAGR", pct(result.cagr_strategy), pct(result.cagr_strategy - result.cagr_buy_hold))
         cols[2].metric("Strategy MDD", pct(result.mdd_strategy))
-        cols[3].metric("Kelly f*", pct(result.kelly_fraction))
-        cols[4].metric("Market exposure", pct(result.market_exposure))
+        cols[3].metric("Sharpe", f"{result.sharpe_ratio:.2f}" if not (result.sharpe_ratio != result.sharpe_ratio) else "N/A")
+        cols[4].metric("Win Rate", pct(result.win_rate))
+        cols[5].metric("# Trades", str(result.num_trades))
+        cols[6].metric("Market exposure", pct(result.market_exposure))
 
         st.markdown("### Price, EMA50, SMA200, ATR trailing stop")
         price_chart = df[["Close", "EMA_50", "SMA_200", "ATR_Trailing_Stop"]].rename(
@@ -102,6 +104,30 @@ if run or ticker:
         st.markdown("### Cross events")
         events = df.loc[df["Golden_Cross"] | df["Death_Cross"], ["Close", "EMA_50", "SMA_200", "Golden_Cross", "Death_Cross"]]
         st.dataframe(events.tail(30), use_container_width=True)
+
+        st.markdown("### Trade log")
+        if result.trades is not None and not result.trades.empty:
+            display_trades = result.trades.copy()
+            display_trades["Return %"] = (display_trades["Return"] * 100).round(2)
+            display_trades = display_trades.drop(columns=["Return"])
+
+            def _color_return(val: float) -> str:
+                return "color: green" if val > 0 else "color: red"
+
+            st.dataframe(
+                display_trades.style.map(_color_return, subset=["Return %"]),
+                use_container_width=True,
+            )
+
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            pf = result.profit_factor
+            pf_str = "∞" if pf == float("inf") else f"{pf:.2f}" if pf == pf else "N/A"
+            tc1.metric("Profit Factor", pf_str)
+            tc2.metric("Avg hold", f"{result.avg_holding_days:.0f}일" if result.avg_holding_days == result.avg_holding_days else "N/A")
+            tc3.metric("Best trade", pct(result.best_trade))
+            tc4.metric("Worst trade", pct(result.worst_trade))
+        else:
+            st.info("해당 기간에 발생한 트레이드가 없습니다.")
 
         with st.expander("Formula guide"):
             st.markdown(

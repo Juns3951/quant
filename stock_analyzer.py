@@ -47,6 +47,15 @@ class LongTermResult:
     warnings: list[str]
     insights: list[str]
     frame: pd.DataFrame | None = None
+    trades: pd.DataFrame | None = None
+    sharpe_ratio: float = float("nan")
+    sortino_ratio: float = float("nan")
+    win_rate: float = float("nan")
+    profit_factor: float = float("nan")
+    num_trades: int = 0
+    avg_holding_days: float = float("nan")
+    best_trade: float = float("nan")
+    worst_trade: float = float("nan")
 
 
 class AnalyzerError(RuntimeError):
@@ -110,6 +119,9 @@ def analyze_price_frame(
     regime = classify_longterm_regime(latest)
     insights, warnings = explain_longterm(latest, prev, metrics, atr_multiplier)
 
+    trades_df = extract_trades(df)
+    t_metrics = trade_metrics(trades_df, df, risk_free_rate=risk_free_rate)
+
     return LongTermResult(
         ticker=ticker.strip().upper(),
         as_of=format_date(df.index[-1]),
@@ -143,6 +155,15 @@ def analyze_price_frame(
         warnings=warnings,
         insights=insights,
         frame=df,
+        trades=trades_df,
+        sharpe_ratio=float(t_metrics["sharpe_ratio"]),
+        sortino_ratio=float(t_metrics["sortino_ratio"]),
+        win_rate=float(t_metrics["win_rate"]),
+        profit_factor=float(t_metrics["profit_factor"]),
+        num_trades=int(t_metrics["num_trades"]),
+        avg_holding_days=float(t_metrics["avg_holding_days"]),
+        best_trade=float(t_metrics["best_trade"]),
+        worst_trade=float(t_metrics["worst_trade"]),
     )
 
 
@@ -200,6 +221,120 @@ def calculate_longterm_backtest(
     out["Strategy_Drawdown"] = out["Strategy_Equity"] / out["Strategy_Equity"].cummax() - 1.0
     out["Buy_Hold_Drawdown"] = out["Buy_Hold_Equity"] / out["Buy_Hold_Equity"].cummax() - 1.0
     return out
+
+
+def extract_trades(df: pd.DataFrame) -> pd.DataFrame:
+    invested = df["Invested"].astype(bool)
+    prev_invested = invested.shift(1, fill_value=False)
+
+    entry_mask = invested & ~prev_invested
+    exit_mask = ~invested & prev_invested
+
+    entry_indices = df.index[entry_mask].tolist()
+    exit_indices = df.index[exit_mask].tolist()
+
+    open_at_end = bool(invested.iloc[-1])
+    if open_at_end:
+        exit_indices.append(df.index[-1])
+
+    records = []
+    for i, (entry_idx, exit_idx) in enumerate(zip(entry_indices, exit_indices)):
+        entry_price = float(df.loc[entry_idx, "Close"])
+
+        is_end_of_data = open_at_end and i == len(exit_indices) - 1
+        if is_end_of_data:
+            last_invested_idx = exit_idx
+            exit_reason = "End of Data"
+        else:
+            last_invested_pos = df.index.get_loc(exit_idx) - 1
+            last_invested_idx = df.index[last_invested_pos]
+            signal_row = df.loc[last_invested_idx]
+            atr_stop = signal_row["ATR_Trailing_Stop"]
+            if signal_row["Death_Cross"]:
+                exit_reason = "Death Cross"
+            elif pd.notna(atr_stop) and signal_row["Close"] < atr_stop:
+                exit_reason = "ATR Stop"
+            else:
+                exit_reason = "Death Cross"
+
+        exit_price = float(df.loc[last_invested_idx, "Close"])
+        holding_days = (last_invested_idx - entry_idx).days
+        trade_return = exit_price / entry_price - 1.0
+
+        records.append({
+            "Entry Date": entry_idx.date(),
+            "Entry Price": round(entry_price, 4),
+            "Exit Date": last_invested_idx.date(),
+            "Exit Price": round(exit_price, 4),
+            "Return": round(trade_return, 6),
+            "Holding Days": holding_days,
+            "Exit Reason": exit_reason,
+        })
+
+    return pd.DataFrame(records)
+
+
+def trade_metrics(
+    trades_df: pd.DataFrame,
+    df: pd.DataFrame,
+    risk_free_rate: float = 0.03,
+) -> dict[str, float]:
+    nan = float("nan")
+    n = len(trades_df)
+    if n == 0:
+        return {
+            "num_trades": 0,
+            "win_rate": nan,
+            "profit_factor": nan,
+            "avg_holding_days": nan,
+            "best_trade": nan,
+            "worst_trade": nan,
+            "sharpe_ratio": nan,
+            "sortino_ratio": nan,
+        }
+
+    returns = trades_df["Return"]
+    wins = returns[returns > 0]
+    losses = returns[returns <= 0]
+    gross_profit = float(wins.sum())
+    gross_loss = float(losses.sum())
+
+    win_rate = len(wins) / n
+    if gross_loss == 0:
+        profit_factor = float("inf")
+    elif gross_profit == 0:
+        profit_factor = 0.0
+    else:
+        profit_factor = gross_profit / abs(gross_loss)
+
+    strategy_ret = df["Strategy_Return"]
+    daily_rf = risk_free_rate / TRADING_DAYS
+    excess = strategy_ret - daily_rf
+    excess_mean = float(excess.mean())
+    excess_std = float(excess.std(ddof=1))
+
+    if excess_std > 0:
+        sharpe_ratio = excess_mean / excess_std * sqrt(TRADING_DAYS)
+    else:
+        sharpe_ratio = float("inf") if excess_mean > 0 else nan
+
+    downside = excess[excess < 0]
+    if len(downside) > 0:
+        downside_std = float(sqrt((downside**2).mean()))
+        sortino_ratio = excess_mean / downside_std * sqrt(TRADING_DAYS) if downside_std > 0 else float("inf")
+    else:
+        sortino_ratio = float("inf")
+
+    return {
+        "num_trades": n,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "avg_holding_days": float(trades_df["Holding Days"].mean()),
+        "best_trade": float(returns.max()),
+        "worst_trade": float(returns.min()),
+        "sharpe_ratio": sharpe_ratio,
+        "sortino_ratio": sortino_ratio,
+    }
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -350,6 +485,12 @@ def format_telegram_report(result: LongTermResult) -> str:
         f"- 무위험 이자율 r: {pct(result.risk_free_rate)}\n"
         f"- 켈리 비중 f*: {pct(result.kelly_fraction)}\n"
         f"- 실전 참고 분수 켈리(0~100% 제한): {pct(result.suggested_fractional_kelly)}\n\n"
+        "트레이드별 성과\n"
+        f"- 총 거래 수: {result.num_trades}회 | 승률: {pct(result.win_rate)}\n"
+        f"- Sharpe: {_fmt_ratio(result.sharpe_ratio)} | Sortino: {_fmt_ratio(result.sortino_ratio)}\n"
+        f"- Profit Factor: {_fmt_ratio(result.profit_factor)}\n"
+        f"- 평균 보유: {_fmt_days(result.avg_holding_days)} | "
+        f"최고: {pct(result.best_trade)} / 최저: {pct(result.worst_trade)}\n\n"
         "핵심 해석\n"
         f"{insights}\n\n"
         "주의\n"
@@ -392,3 +533,25 @@ def normalize_longterm_period(period: str) -> str:
     if normalized in {"5y", "10y", "max"}:
         return normalized
     return "max"
+
+
+def _fmt_ratio(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if np.isnan(number):
+        return "N/A"
+    if np.isinf(number):
+        return "∞" if number > 0 else "-∞"
+    return f"{number:.2f}"
+
+
+def _fmt_days(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if np.isnan(number):
+        return "N/A"
+    return f"{number:.0f}일"

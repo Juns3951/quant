@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import math
 import os
+import time
 from typing import Any
 
 from fastapi import FastAPI
@@ -13,6 +14,21 @@ from chart_generator import generate_backtest_chart
 from stock_analyzer import AnalyzerError, analyze_ticker, pct, _fmt_ratio, _fmt_days
 
 app = FastAPI(title="Long-Term Quant Analyzer")
+
+# 티커별 분석 결과를 1시간 동안 캐시 (rate limit 방지)
+_cache: dict[str, tuple[float, Any]] = {}
+_CACHE_TTL = 3600
+
+
+def _get_cached(key: str) -> Any | None:
+    entry = _cache.get(key)
+    if entry and time.time() - entry[0] < _CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _set_cache(key: str, value: Any) -> None:
+    _cache[key] = (time.time(), value)
 
 
 class AnalyzeRequest(BaseModel):
@@ -30,6 +46,11 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
     ticker = req.ticker.strip().upper()
     if not ticker:
         return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
+
+    cache_key = f"{ticker}:{req.period}"
+    cached = _get_cached(cache_key)
+    if cached:
+        return JSONResponse(cached)
 
     try:
         result = analyze_ticker(ticker, req.period)
@@ -57,7 +78,7 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
                 "exit_reason": row["Exit Reason"],
             })
 
-    return JSONResponse({
+    payload = {
         "ticker": result.ticker,
         "as_of": result.as_of,
         "start_date": result.start_date,
@@ -92,7 +113,9 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
         "warnings": result.warnings,
         "trades": trades_data,
         "chart": chart_b64,
-    })
+    }
+    _set_cache(cache_key, payload)
+    return JSONResponse(payload)
 
 
 HTML = """<!DOCTYPE html>
@@ -195,7 +218,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div id="errorBox" class="error-box"></div>
-  <div id="spinner" class="spinner">⏳ 데이터 수집 중... (최대 30초)</div>
+  <div id="spinner" class="spinner">⏳ 데이터 수집 중...<br><small style="font-size:0.75rem;opacity:0.7">처음 접속 시 서버 워밍업으로 최대 60초 소요될 수 있습니다</small></div>
 
   <div id="result">
     <div class="result-header">
@@ -287,12 +310,17 @@ async function runAnalysis() {
   $('errorBox').classList.remove('active');
   $('result').classList.remove('active');
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120000); // 2분 타임아웃
+
   try {
     const resp = await fetch('/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ticker, period: 'max' }),
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     const data = await resp.json();
 
     if (data.error) {
@@ -304,7 +332,12 @@ async function runAnalysis() {
     render(data);
     $('result').classList.add('active');
   } catch(e) {
-    $('errorBox').textContent = '네트워크 오류가 발생했습니다.';
+    clearTimeout(timeoutId);
+    if (e.name === 'AbortError') {
+      $('errorBox').textContent = '요청 시간이 초과됐습니다. 잠시 후 다시 시도해주세요.';
+    } else {
+      $('errorBox').textContent = '서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.';
+    }
     $('errorBox').classList.add('active');
   } finally {
     $('spinner').classList.remove('active');

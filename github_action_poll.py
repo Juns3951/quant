@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from chart_generator import generate_backtest_chart
 from request_parser import TICKER_RE, parse_request
 from stock_analyzer import AnalyzerError, analyze_ticker, format_telegram_report
 
@@ -89,6 +90,9 @@ def handle_update(token: str, update: dict[str, Any]) -> None:
     try:
         result = analyze_ticker(ticker, period, benchmark)
         send_long_message(token, chat_id, format_telegram_report(result))
+        chart_bytes = generate_backtest_chart(result)
+        if chart_bytes:
+            send_photo(token, chat_id, chart_bytes, caption=f"{result.ticker} 백테스트 차트")
     except AnalyzerError as exc:
         send_message(token, chat_id, str(exc))
     except Exception as exc:
@@ -120,6 +124,40 @@ def send_long_message(token: str, chat_id: int | str, text: str) -> None:
 
 def send_message(token: str, chat_id: int | str, text: str) -> None:
     telegram_call(token, "sendMessage", {"chat_id": chat_id, "text": text[:4096]})
+
+
+def send_photo(token: str, chat_id: int | str, photo_bytes: bytes, caption: str = "") -> None:
+    import email.generator
+    import email.mime.multipart
+    import email.mime.application
+    import email.mime.text
+    import uuid
+
+    boundary = uuid.uuid4().hex
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+        f"{chat_id}\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="caption"\r\n\r\n'
+        f"{caption}\r\n"
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="photo"; filename="chart.png"\r\n'
+        f"Content-Type: image/png\r\n\r\n"
+    ).encode("utf-8") + photo_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response.read()
+    except Exception as exc:
+        print(f"send_photo failed: {exc}", file=sys.stderr)
 
 
 def telegram_call(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:

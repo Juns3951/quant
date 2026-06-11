@@ -218,7 +218,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div id="errorBox" class="error-box"></div>
-  <div id="spinner" class="spinner">⏳ 데이터 수집 중... (최대 30초)</div>
+  <div id="spinner" class="spinner">⏳ 데이터 수집 중...<br><small style="font-size:0.75rem;opacity:0.7">처음 접속 시 서버 워밍업으로 최대 60초 소요될 수 있습니다</small></div>
 
   <div id="result">
     <div class="result-header">
@@ -310,12 +310,17 @@ async function runAnalysis() {
   $('errorBox').classList.remove('active');
   $('result').classList.remove('active');
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 120000); // 2분 타임아웃
+
   try {
     const resp = await fetch('/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ticker, period: 'max' }),
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
     const data = await resp.json();
 
     if (data.error) {
@@ -327,7 +332,12 @@ async function runAnalysis() {
     render(data);
     $('result').classList.add('active');
   } catch(e) {
-    $('errorBox').textContent = '네트워크 오류가 발생했습니다.';
+    clearTimeout(timeoutId);
+    if (e.name === 'AbortError') {
+      $('errorBox').textContent = '요청 시간이 초과됐습니다. 잠시 후 다시 시도해주세요.';
+    } else {
+      $('errorBox').textContent = '서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.';
+    }
     $('errorBox').classList.add('active');
   } finally {
     $('spinner').classList.remove('active');

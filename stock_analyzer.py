@@ -63,6 +63,8 @@ class AnalyzerError(RuntimeError):
 
 
 def fetch_history(ticker: str, period: str = "max", start: str = LONGTERM_START) -> pd.DataFrame:
+    import time
+
     try:
         import yfinance as yf
     except ImportError as exc:
@@ -74,14 +76,24 @@ def fetch_history(ticker: str, period: str = "max", start: str = LONGTERM_START)
     cache_dir.mkdir(exist_ok=True)
     yf.set_tz_cache_location(str(cache_dir))
 
-    if period == "max":
-        data = yf.Ticker(ticker).history(start=start, interval="1d", auto_adjust=True)
-    else:
-        data = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+    last_exc: Exception | None = None
+    for attempt in range(4):
+        if attempt:
+            time.sleep(2 ** attempt)  # 2s, 4s, 8s
+        try:
+            if period == "max":
+                data = yf.Ticker(ticker).history(start=start, interval="1d", auto_adjust=True)
+            else:
+                data = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
+            if not data.empty:
+                return data
+            last_exc = None
+        except Exception as exc:
+            last_exc = exc
 
-    if data.empty:
-        raise AnalyzerError(f"{ticker} 데이터를 가져오지 못했습니다. 티커 표기를 확인하세요.")
-    return data
+    if last_exc:
+        raise AnalyzerError(f"데이터 수집 실패 ({ticker}): {last_exc}") from last_exc
+    raise AnalyzerError(f"{ticker} 데이터를 가져오지 못했습니다. 티커 표기를 확인하세요.")
 
 
 def analyze_ticker(

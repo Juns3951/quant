@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import math
 import os
+import time
 from typing import Any
 
 from fastapi import FastAPI
@@ -13,6 +14,21 @@ from chart_generator import generate_backtest_chart
 from stock_analyzer import AnalyzerError, analyze_ticker, pct, _fmt_ratio, _fmt_days
 
 app = FastAPI(title="Long-Term Quant Analyzer")
+
+# 티커별 분석 결과를 1시간 동안 캐시 (rate limit 방지)
+_cache: dict[str, tuple[float, Any]] = {}
+_CACHE_TTL = 3600
+
+
+def _get_cached(key: str) -> Any | None:
+    entry = _cache.get(key)
+    if entry and time.time() - entry[0] < _CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _set_cache(key: str, value: Any) -> None:
+    _cache[key] = (time.time(), value)
 
 
 class AnalyzeRequest(BaseModel):
@@ -30,6 +46,11 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
     ticker = req.ticker.strip().upper()
     if not ticker:
         return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
+
+    cache_key = f"{ticker}:{req.period}"
+    cached = _get_cached(cache_key)
+    if cached:
+        return JSONResponse(cached)
 
     try:
         result = analyze_ticker(ticker, req.period)
@@ -57,7 +78,7 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
                 "exit_reason": row["Exit Reason"],
             })
 
-    return JSONResponse({
+    payload = {
         "ticker": result.ticker,
         "as_of": result.as_of,
         "start_date": result.start_date,
@@ -92,7 +113,9 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
         "warnings": result.warnings,
         "trades": trades_data,
         "chart": chart_b64,
-    })
+    }
+    _set_cache(cache_key, payload)
+    return JSONResponse(payload)
 
 
 HTML = """<!DOCTYPE html>

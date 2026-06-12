@@ -65,6 +65,9 @@ def _build_payload(result: Any) -> dict[str, Any]:
         "regime": result.regime,
         "confidence": result.confidence,
         "invested_now": result.invested_now,
+        "entry_score": result.entry_score,
+        "entry_verdict": result.entry_verdict,
+        "entry_factors": result.entry_factors or [],
         "metrics": {
             "current_price": result.current_price,
             "ema50": result.ema50,
@@ -189,6 +192,26 @@ HTML = """<!DOCTYPE html>
   #result { display: none; }
   #result.active { display: block; }
 
+  .verdict-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px 18px; margin-bottom: 14px; text-align: center; }
+  .verdict-label { font-size: 0.8rem; color: var(--muted); margin-bottom: 8px; }
+  .verdict-main { font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 14px; }
+  .verdict-main.buy { color: var(--green); }
+  .verdict-main.consider { color: #7ee787; }
+  .verdict-main.wait { color: var(--orange); }
+  .verdict-main.avoid { color: var(--red); }
+  .gauge { height: 10px; background: #21262d; border-radius: 6px; overflow: hidden; margin-bottom: 8px; }
+  .gauge-fill { height: 100%; border-radius: 6px; transition: width 0.6s ease; }
+  .verdict-score { font-size: 1.1rem; font-weight: 700; margin-bottom: 16px; }
+  .verdict-score-max { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
+  .factors { display: flex; flex-direction: column; gap: 8px; text-align: left; }
+  .factor { background: var(--bg); border-radius: 8px; padding: 9px 11px; }
+  .factor-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+  .factor-name { font-size: 0.82rem; font-weight: 600; }
+  .factor-score { font-size: 0.82rem; font-weight: 700; }
+  .factor-detail { font-size: 0.72rem; color: var(--muted); }
+  .factor-bar { height: 4px; background: #21262d; border-radius: 3px; margin-top: 5px; overflow: hidden; }
+  .factor-bar-fill { height: 100%; border-radius: 3px; }
+
   .result-header { margin-bottom: 16px; }
   .result-header .ticker-name { font-size: 1.4rem; font-weight: 700; }
   .result-header .meta { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
@@ -235,8 +258,8 @@ HTML = """<!DOCTYPE html>
 <body>
 <div class="container">
   <header>
-    <h1>Long-Term Quant</h1>
-    <p>EMA50/SMA200 + ATR 추적손절 전략 백테스트</p>
+    <h1>진입 타이밍 분석기</h1>
+    <p>정량 지표로 "지금 사도 될지"를 0~100점으로 판단</p>
   </header>
 
   <div class="search-box">
@@ -254,6 +277,14 @@ HTML = """<!DOCTYPE html>
         <span id="rInvestedTag"></span>
       </div>
       <div class="meta" id="rMeta"></div>
+    </div>
+
+    <div class="verdict-card" id="verdictCard">
+      <div class="verdict-label">지금 진입해도 될까?</div>
+      <div class="verdict-main" id="vVerdict"></div>
+      <div class="gauge"><div class="gauge-fill" id="vGaugeFill"></div></div>
+      <div class="verdict-score"><span id="vScore"></span> <span class="verdict-score-max">/ 100점</span></div>
+      <div class="factors" id="vFactors"></div>
       <div id="rAction" class="action-badge"></div>
     </div>
 
@@ -385,6 +416,13 @@ function showError(msg) {
   $('errorBox').classList.add('active');
 }
 
+function scoreColor(s) {
+  if (s >= 75) return '#3fb950';
+  if (s >= 60) return '#7ee787';
+  if (s >= 40) return '#f0883e';
+  return '#f85149';
+}
+
 function render(d) {
   const m = d.metrics;
   $('rTicker').textContent = d.ticker;
@@ -393,8 +431,33 @@ function render(d) {
     : '<span class="tag bear">현금</span>';
   $('rMeta').textContent = `${d.start_date} ~ ${d.as_of} | ${d.rows.toLocaleString()}거래일 | 신뢰도: ${d.confidence}`;
 
+  // 진입 판정 카드
+  const score = d.entry_score ?? 0;
+  const verdict = d.entry_verdict || '-';
+  const vMain = $('vVerdict');
+  vMain.textContent = verdict;
+  const vClass = verdict.includes('적극') ? 'buy' : verdict.includes('고려') ? 'consider' : verdict.includes('관망') ? 'wait' : 'avoid';
+  vMain.className = 'verdict-main ' + vClass;
+  $('vScore').textContent = Math.round(score);
+  const col = scoreColor(score);
+  $('vGaugeFill').style.width = score + '%';
+  $('vGaugeFill').style.background = col;
+
+  const fWrap = $('vFactors');
+  fWrap.innerHTML = (d.entry_factors || []).map(f => {
+    const c = scoreColor(f.score);
+    return `<div class="factor">
+      <div class="factor-top">
+        <span class="factor-name">${f.name} <span style="color:var(--muted);font-weight:400">(비중 ${f.weight}%)</span></span>
+        <span class="factor-score" style="color:${c}">${f.score}점</span>
+      </div>
+      <div class="factor-detail">${f.detail}</div>
+      <div class="factor-bar"><div class="factor-bar-fill" style="width:${f.score}%;background:${c}"></div></div>
+    </div>`;
+  }).join('');
+
   const act = $('rAction');
-  act.textContent = d.action;
+  act.textContent = '전략 신호: ' + d.action;
   act.className = 'action-badge ' + (d.invested_now ? 'bull' : d.action.includes('매수') ? 'bull' : d.action.includes('매도') || d.action.includes('청산') ? 'bear' : 'hold');
 
   if (d.chart) {

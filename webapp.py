@@ -309,7 +309,7 @@ HTML = """<!DOCTYPE html>
       <div class="metrics-grid">
         <div class="metric"><div class="label">총 거래 수</div><div class="value neutral" id="mTrades"></div></div>
         <div class="metric"><div class="label">승률</div><div class="value" id="mWinRate"></div></div>
-ractice<div class="metric"><div class="label">Profit Factor</div><div class="value" id="mPF"></div></div>
+        <div class="metric"><div class="label">Profit Factor</div><div class="value" id="mPF"></div></div>
         <div class="metric"><div class="label">평균 보유</div><div class="value neutral" id="mAvgHold"></div></div>
         <div class="metric"><div class="label">최고 거래</div><div class="value positive" id="mBest"></div></div>
         <div class="metric"><div class="label">최저 거래</div><div class="value negative" id="mWorst"></div></div>

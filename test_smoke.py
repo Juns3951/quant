@@ -37,10 +37,15 @@ if __name__ == "__main__":
     frame = make_sample_frame()
     result = analyze_price_frame("SAMPLE", frame)
     report = format_telegram_report(result)
-    assert "SAMPLE 장기 퀀트 분석" in report
+    assert "SAMPLE 진입 분석" in report
     assert result.rows > 220
     assert result.trades is not None
     assert result.num_trades >= 0
+    # 진입 판정 검증
+    assert 0.0 <= result.entry_score <= 100.0
+    assert result.entry_verdict in {"적극 진입", "진입 고려", "관망", "진입 회피"}
+    assert result.entry_factors and len(result.entry_factors) == 5
+    assert "진입 판정" in report and "진입 적합도" in report
     if result.num_trades > 0:
         assert {"Entry Date", "Exit Date", "Return", "Exit Reason"}.issubset(result.trades.columns)
         assert 0.0 <= result.win_rate <= 1.0

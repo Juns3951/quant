@@ -56,6 +56,10 @@ class LongTermResult:
     avg_holding_days: float = float("nan")
     best_trade: float = float("nan")
     worst_trade: float = float("nan")
+    entry_score: float = float("nan")
+    entry_verdict: str = ""
+    entry_factors: list[dict[str, Any]] | None = None
+    rsi14: float = float("nan")
 
 
 class AnalyzerError(RuntimeError):
@@ -133,6 +137,7 @@ def analyze_price_frame(
 
     trades_df = extract_trades(df)
     t_metrics = trade_metrics(trades_df, df, risk_free_rate=risk_free_rate)
+    entry = entry_assessment(latest, metrics)
 
     return LongTermResult(
         ticker=ticker.strip().upper(),
@@ -176,6 +181,10 @@ def analyze_price_frame(
         avg_holding_days=float(t_metrics["avg_holding_days"]),
         best_trade=float(t_metrics["best_trade"]),
         worst_trade=float(t_metrics["worst_trade"]),
+        entry_score=float(entry["score"]),
+        entry_verdict=entry["verdict"],
+        entry_factors=entry["factors"],
+        rsi14=float(entry["rsi14"]),
     )
 
 
@@ -212,6 +221,7 @@ def calculate_longterm_backtest(
     out["EMA_50"] = close.ewm(span=50, adjust=False).mean()
     out["SMA_200"] = close.rolling(200).mean()
     out["ATR_14"] = atr(out["High"], out["Low"], close)
+    out["RSI_14"] = rsi(close)
 
     out["Bull_Regime"] = out["EMA_50"] > out["SMA_200"]
     prev_bull = out["Bull_Regime"].shift(1, fill_value=False).astype(bool)
@@ -357,6 +367,16 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return (100.0 - 100.0 / (1.0 + rs)).fillna(50.0)
+
+
 def performance_metrics(df: pd.DataFrame, risk_free_rate: float = 0.03) -> dict[str, float]:
     years = max((df.index[-1] - df.index[0]).days / 365.25, 1 / 365.25)
     cumulative_strategy = df["Strategy_Equity"].iloc[-1] / df["Strategy_Equity"].iloc[0]
@@ -398,6 +418,140 @@ def decide_longterm_action(latest: pd.Series, prev: pd.Series) -> str:
     if prev["Close"] < prev["ATR_Trailing_Stop"] and latest["Close"] >= latest["ATR_Trailing_Stop"]:
         return "재진입 후보: 장기 상승장 안에서 ATR 손절선 회복"
     return "장기 보유 유지: 상승장 필터와 ATR 방어선 유지"
+
+
+def entry_assessment(latest: pd.Series, metrics: dict[str, float]) -> dict[str, Any]:
+    """여러 정량 지표를 종합해 0~100 진입 적합도 점수와 판정을 계산한다."""
+    close = float(latest["Close"])
+    ema50 = float(latest["EMA_50"])
+    sma200 = float(latest["SMA_200"])
+    atr14 = float(latest["ATR_14"])
+    rsi14 = float(latest.get("RSI_14", 50.0))
+    stop = float(latest["ATR_Trailing_Stop"]) if pd.notna(latest["ATR_Trailing_Stop"]) else None
+    bull = bool(latest["Bull_Regime"])
+
+    factors: list[dict[str, Any]] = []
+
+    # 1) 추세 방향 (가중치 30) — EMA50가 SMA200 대비 얼마나 위/아래인가
+    trend_gap = ema50 / sma200 - 1.0 if sma200 else 0.0
+    if bull:
+        trend_score = min(100.0, 50.0 + trend_gap * 1000.0)  # +5%면 100점
+    else:
+        trend_score = max(0.0, 40.0 + trend_gap * 800.0)     # 약세일수록 낮음
+    trend_score = max(0.0, min(100.0, trend_score))
+    factors.append({
+        "name": "추세 방향",
+        "score": round(trend_score),
+        "weight": 30,
+        "detail": f"EMA50가 SMA200 {'위' if trend_gap >= 0 else '아래'} {abs(trend_gap)*100:.1f}% ({'강세' if bull else '약세'})",
+    })
+
+    # 2) 모멘텀 (RSI, 가중치 20) — 과열도 침체도 아닌 건강한 구간 선호
+    if rsi14 >= 70:
+        rsi_score = max(20.0, 100.0 - (rsi14 - 70.0) * 4.0)  # 과열
+        rsi_msg = "과열(되돌림 위험)"
+    elif rsi14 >= 55:
+        rsi_score = 90.0
+        rsi_msg = "건강한 상승 모멘텀"
+    elif rsi14 >= 45:
+        rsi_score = 100.0
+        rsi_msg = "안정 구간(눌림목)"
+    elif rsi14 >= 30:
+        rsi_score = 75.0
+        rsi_msg = "약한 모멘텀"
+    else:
+        rsi_score = 40.0
+        rsi_msg = "침체(하락 지속 위험)"
+    factors.append({
+        "name": "모멘텀(RSI)",
+        "score": round(rsi_score),
+        "weight": 20,
+        "detail": f"RSI {rsi14:.0f} · {rsi_msg}",
+    })
+
+    # 3) 이격도 (가중치 20) — EMA50 대비 현재가 위치, 추격매수 방지
+    ema_gap = close / ema50 - 1.0 if ema50 else 0.0
+    if -0.02 <= ema_gap <= 0.03:
+        dist_score = 100.0
+        dist_msg = "EMA50 부근(이상적 진입대)"
+    elif 0.03 < ema_gap <= 0.08:
+        dist_score = 70.0
+        dist_msg = "다소 위로 확장"
+    elif ema_gap > 0.08:
+        dist_score = max(35.0, 70.0 - (ema_gap - 0.08) * 300.0)
+        dist_msg = "과도하게 확장(추격 위험)"
+    else:  # 큰 폭으로 EMA50 아래
+        dist_score = 55.0 if bull else 35.0
+        dist_msg = "EMA50 아래(눌림 또는 약세)"
+    factors.append({
+        "name": "이격도",
+        "score": round(dist_score),
+        "weight": 20,
+        "detail": f"현재가가 EMA50 {'위' if ema_gap >= 0 else '아래'} {abs(ema_gap)*100:.1f}% · {dist_msg}",
+    })
+
+    # 4) 손절 여유/리스크 (가중치 15) — 손절선까지 하방 폭이 작을수록 진입 리스크 낮음
+    if stop is not None and close > 0:
+        downside = max(0.0, close / stop - 1.0)  # 손절선까지 하락 여지
+        if close < stop:
+            risk_score = 10.0
+            risk_msg = "손절선 이탈(진입 부적합)"
+        elif downside <= 0.08:
+            risk_score = 100.0
+            risk_msg = f"손절선까지 -{downside*100:.1f}% (리스크 작음)"
+        elif downside <= 0.18:
+            risk_score = 70.0
+            risk_msg = f"손절선까지 -{downside*100:.1f}%"
+        else:
+            risk_score = 45.0
+            risk_msg = f"손절선까지 -{downside*100:.1f}% (손절폭 큼)"
+    else:
+        risk_score = 50.0
+        risk_msg = "손절선 미형성"
+    factors.append({
+        "name": "손절 여유",
+        "score": round(risk_score),
+        "weight": 15,
+        "detail": risk_msg,
+    })
+
+    # 5) 변동성 (가중치 15) — ATR/가격, 낮을수록 안정적
+    vol_ratio = atr14 / close if close else 0.0
+    if vol_ratio <= 0.02:
+        vol_score = 100.0
+    elif vol_ratio <= 0.04:
+        vol_score = 70.0
+    else:
+        vol_score = max(30.0, 70.0 - (vol_ratio - 0.04) * 1000.0)
+    factors.append({
+        "name": "변동성",
+        "score": round(vol_score),
+        "weight": 15,
+        "detail": f"일일 변동성(ATR/가격) {vol_ratio*100:.1f}%",
+    })
+
+    # 가중 합산
+    total_weight = sum(f["weight"] for f in factors)
+    score = sum(f["score"] * f["weight"] for f in factors) / total_weight
+
+    # 약세장(데드크로스)·손절 이탈 시 상한 캡 — 정량적으로 강세가 아니면 진입 점수를 누름
+    if not bull:
+        score = min(score, 45.0)
+    if stop is not None and close < stop:
+        score = min(score, 30.0)
+
+    score = round(max(0.0, min(100.0, score)), 1)
+
+    if score >= 75:
+        verdict = "적극 진입"
+    elif score >= 60:
+        verdict = "진입 고려"
+    elif score >= 40:
+        verdict = "관망"
+    else:
+        verdict = "진입 회피"
+
+    return {"score": score, "verdict": verdict, "factors": factors, "rsi14": rsi14}
 
 
 def classify_longterm_regime(latest: pd.Series) -> str:
@@ -469,10 +623,18 @@ def explain_longterm(
 def format_telegram_report(result: LongTermResult) -> str:
     insights = "\n".join(f"- {item}" for item in result.insights) or "- 뚜렷한 장기 강세 근거가 제한적입니다."
     warnings = "\n".join(f"- {item}" for item in result.warnings)
+    factors = result.entry_factors or []
+    factor_lines = "\n".join(
+        f"- {f['name']}: {f['score']}점 · {f['detail']}" for f in factors
+    )
 
     return (
-        f"{result.ticker} 장기 퀀트 분석 ({result.as_of})\n\n"
-        f"판정: {result.action}\n"
+        f"{result.ticker} 진입 분석 ({result.as_of})\n\n"
+        f"■ 진입 판정: {result.entry_verdict}\n"
+        f"■ 진입 적합도: {result.entry_score:.0f} / 100점\n\n"
+        "지표별 점수\n"
+        f"{factor_lines}\n\n"
+        f"전략 신호: {result.action}\n"
         f"신뢰도: {result.confidence}\n"
         f"국면: {result.regime}\n"
         f"분석 기간: {result.start_date} ~ {result.as_of} / {result.rows:,}거래일\n\n"

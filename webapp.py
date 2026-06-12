@@ -359,6 +359,34 @@ function colorClass(val) {
   return n >= 0 ? 'positive' : 'negative';
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function setSpinner(msg) {
+  const p = $('spinner').querySelector('p');
+  if (p) p.textContent = msg;
+}
+
+async function postAnalyze(ticker) {
+  // 서버 콜드스타트 대응: 실패 시 최대 10회(~60초) 재시도
+  for (let attempt = 0; attempt < 10; attempt++) {
+    if (attempt > 0) {
+      setSpinner(`⏳ 서버 시작 중... ${attempt * 6}초 경과 (최대 60초)`);
+      await sleep(6000);
+    }
+    try {
+      const resp = await fetch('/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ticker, period: 'max' }),
+      });
+      if (!resp.ok) continue; // 503 등 재시도
+      const data = await resp.json();
+      return data;
+    } catch (_) { /* 네트워크 오류 → 재시도 */ }
+  }
+  return null;
+}
+
 async function runAnalysis() {
   const ticker = $('tickerInput').value.trim().toUpperCase();
   if (!ticker) { $('tickerInput').focus(); return; }
@@ -367,16 +395,12 @@ async function runAnalysis() {
   $('spinner').classList.add('active');
   $('errorBox').classList.remove('active');
   $('result').classList.remove('active');
+  setSpinner('⏳ 분석 시작 중...');
 
   try {
-    // 1단계: 분석 작업 시작 (즉시 응답)
-    const resp = await fetch('/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ticker, period: 'max' }),
-    });
-    const init = await resp.json();
-
+    // 1단계: 분석 작업 시작 (즉시 응답, 서버 콜드스타트 시 재시도 포함)
+    const init = await postAnalyze(ticker);
+    if (!init) { showError('서버에 연결할 수 없습니다. 잠시 후 다시 시도해주세요.'); return; }
     if (init.error) { showError(init.error); return; }
 
     // 캐시 히트: 바로 렌더
@@ -387,24 +411,22 @@ async function runAnalysis() {
     const deadline = Date.now() + 5 * 60 * 1000;
     let elapsed = 0;
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 3000));
+      await sleep(3000);
       elapsed += 3;
-      $('spinner').querySelector('p') && ($('spinner').querySelector('p').textContent = `분석 중... ${elapsed}초`);
+      setSpinner(`⏳ 분석 중... ${elapsed}초`);
 
-      const poll = await fetch(`/result/${jobId}`);
-      const data = await poll.json();
-
-      if (data.status === 'done') {
-        render(data.payload);
-        $('result').classList.add('active');
-        return;
-      }
-      if (data.status === 'error') { showError(data.error); return; }
-      // pending → 계속 폴링
+      try {
+        const poll = await fetch(`/result/${jobId}`);
+        const data = await poll.json();
+        if (data.status === 'done') {
+          render(data.payload);
+          $('result').classList.add('active');
+          return;
+        }
+        if (data.status === 'error') { showError(data.error); return; }
+      } catch (_) { /* 일시적 네트워크 오류 → 계속 폴링 */ }
     }
     showError('시간이 너무 오래 걸립니다. 잠시 후 다시 시도해주세요.');
-  } catch(e) {
-    showError('서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.');
   } finally {
     $('spinner').classList.remove('active');
     $('analyzeBtn').disabled = false;

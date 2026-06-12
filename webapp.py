@@ -423,6 +423,23 @@ $('tickerInput').addEventListener('keydown', e => { if (e.key === 'Enter') runAn
 
 
 if __name__ == "__main__":
+    import threading
+    import webbrowser
+
     import uvicorn
+
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("webapp:app", host="0.0.0.0", port=port, reload=False)
+    local_url = f"http://127.0.0.1:{port}"
+
+    # 로컬 실행일 때만 브라우저 자동 열기 (PORT 환경변수가 없으면 로컬로 간주)
+    if not os.getenv("PORT"):
+        print("\n" + "=" * 50)
+        print("  Long-Term Quant 앱이 실행됩니다")
+        print(f"  브라우저 주소: {local_url}")
+        print("  같은 와이파이의 폰에서 접속하려면:")
+        print(f"    http://<이 컴퓨터의 IP>:{port}")
+        print("  종료하려면 이 창에서 Ctrl+C 를 누르세요")
+        print("=" * 50 + "\n")
+        threading.Timer(1.5, lambda: webbrowser.open(local_url)).start()
+
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import math
 import os
 import time
+import uuid
 from typing import Any
 
 from fastapi import FastAPI
@@ -15,9 +17,12 @@ from stock_analyzer import AnalyzerError, analyze_ticker, pct, _fmt_ratio, _fmt_
 
 app = FastAPI(title="Long-Term Quant Analyzer")
 
-# 티커별 분석 결과를 1시간 동안 캐시 (rate limit 방지)
+# 결과 캐시 (1시간)
 _cache: dict[str, tuple[float, Any]] = {}
 _CACHE_TTL = 3600
+
+# 백그라운드 작업 저장소
+_jobs: dict[str, dict[str, Any]] = {}
 
 
 def _get_cached(key: str) -> Any | None:
@@ -31,34 +36,7 @@ def _set_cache(key: str, value: Any) -> None:
     _cache[key] = (time.time(), value)
 
 
-class AnalyzeRequest(BaseModel):
-    ticker: str
-    period: str = "max"
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    return HTMLResponse(HTML)
-
-
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest) -> JSONResponse:
-    ticker = req.ticker.strip().upper()
-    if not ticker:
-        return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
-
-    cache_key = f"{ticker}:{req.period}"
-    cached = _get_cached(cache_key)
-    if cached:
-        return JSONResponse(cached)
-
-    try:
-        result = analyze_ticker(ticker, req.period)
-    except AnalyzerError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    except Exception as exc:
-        return JSONResponse({"error": f"분석 오류: {exc}"}, status_code=500)
-
+def _build_payload(result: Any) -> dict[str, Any]:
     chart_bytes = generate_backtest_chart(result)
     chart_b64 = base64.b64encode(chart_bytes).decode() if chart_bytes else None
 
@@ -78,7 +56,7 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
                 "exit_reason": row["Exit Reason"],
             })
 
-    payload = {
+    return {
         "ticker": result.ticker,
         "as_of": result.as_of,
         "start_date": result.start_date,
@@ -87,6 +65,9 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
         "regime": result.regime,
         "confidence": result.confidence,
         "invested_now": result.invested_now,
+        "entry_score": result.entry_score,
+        "entry_verdict": result.entry_verdict,
+        "entry_factors": result.entry_factors or [],
         "metrics": {
             "current_price": result.current_price,
             "ema50": result.ema50,
@@ -114,8 +95,57 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
         "trades": trades_data,
         "chart": chart_b64,
     }
-    _set_cache(cache_key, payload)
-    return JSONResponse(payload)
+
+
+async def _run_job(job_id: str, ticker: str, period: str, cache_key: str) -> None:
+    try:
+        result = await asyncio.to_thread(analyze_ticker, ticker, period)
+        payload = await asyncio.to_thread(_build_payload, result)
+        _set_cache(cache_key, payload)
+        _jobs[job_id] = {"status": "done", "payload": payload}
+    except AnalyzerError as exc:
+        _jobs[job_id] = {"status": "error", "error": str(exc)}
+    except Exception as exc:
+        _jobs[job_id] = {"status": "error", "error": f"분석 오류: {exc}"}
+
+
+class AnalyzeRequest(BaseModel):
+    ticker: str
+    period: str = "max"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    return HTMLResponse(HTML)
+
+
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest) -> JSONResponse:
+    ticker = req.ticker.strip().upper()
+    if not ticker:
+        return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
+
+    cache_key = f"{ticker}:{req.period}"
+    cached = _get_cached(cache_key)
+    if cached:
+        return JSONResponse({"status": "done", "payload": cached})
+
+    job_id = uuid.uuid4().hex[:10]
+    _jobs[job_id] = {"status": "pending"}
+    asyncio.create_task(_run_job(job_id, ticker, req.period, cache_key))
+    return JSONResponse({"status": "pending", "job_id": job_id})
+
+
+@app.get("/result/{job_id}")
+async def get_result(job_id: str) -> JSONResponse:
+    job = _jobs.get(job_id)
+    if not job:
+        return JSONResponse({"status": "error", "error": "작업을 찾을 수 없습니다."}, status_code=404)
+    if job["status"] == "pending":
+        return JSONResponse({"status": "pending"})
+    if job["status"] == "error":
+        return JSONResponse({"status": "error", "error": job["error"]})
+    return JSONResponse({"status": "done", "payload": job["payload"]})
 
 
 HTML = """<!DOCTYPE html>
@@ -161,6 +191,26 @@ HTML = """<!DOCTYPE html>
 
   #result { display: none; }
   #result.active { display: block; }
+
+  .verdict-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px 18px; margin-bottom: 14px; text-align: center; }
+  .verdict-label { font-size: 0.8rem; color: var(--muted); margin-bottom: 8px; }
+  .verdict-main { font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 14px; }
+  .verdict-main.buy { color: var(--green); }
+  .verdict-main.consider { color: #7ee787; }
+  .verdict-main.wait { color: var(--orange); }
+  .verdict-main.avoid { color: var(--red); }
+  .gauge { height: 10px; background: #21262d; border-radius: 6px; overflow: hidden; margin-bottom: 8px; }
+  .gauge-fill { height: 100%; border-radius: 6px; transition: width 0.6s ease; }
+  .verdict-score { font-size: 1.1rem; font-weight: 700; margin-bottom: 16px; }
+  .verdict-score-max { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
+  .factors { display: flex; flex-direction: column; gap: 8px; text-align: left; }
+  .factor { background: var(--bg); border-radius: 8px; padding: 9px 11px; }
+  .factor-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+  .factor-name { font-size: 0.82rem; font-weight: 600; }
+  .factor-score { font-size: 0.82rem; font-weight: 700; }
+  .factor-detail { font-size: 0.72rem; color: var(--muted); }
+  .factor-bar { height: 4px; background: #21262d; border-radius: 3px; margin-top: 5px; overflow: hidden; }
+  .factor-bar-fill { height: 100%; border-radius: 3px; }
 
   .result-header { margin-bottom: 16px; }
   .result-header .ticker-name { font-size: 1.4rem; font-weight: 700; }
@@ -208,8 +258,8 @@ HTML = """<!DOCTYPE html>
 <body>
 <div class="container">
   <header>
-    <h1>Long-Term Quant</h1>
-    <p>EMA50/SMA200 + ATR 추적손절 전략 백테스트</p>
+    <h1>진입 타이밍 분석기</h1>
+    <p>정량 지표로 "지금 사도 될지"를 0~100점으로 판단</p>
   </header>
 
   <div class="search-box">
@@ -218,7 +268,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div id="errorBox" class="error-box"></div>
-  <div id="spinner" class="spinner">⏳ 데이터 수집 중...<br><small style="font-size:0.75rem;opacity:0.7">처음 접속 시 서버 워밍업으로 최대 60초 소요될 수 있습니다</small></div>
+  <div id="spinner" class="spinner"><p>⏳ 분석 시작 중...</p><small style="font-size:0.75rem;opacity:0.7">처음에는 데이터 수집으로 1~2분 걸릴 수 있습니다</small></div>
 
   <div id="result">
     <div class="result-header">
@@ -227,6 +277,14 @@ HTML = """<!DOCTYPE html>
         <span id="rInvestedTag"></span>
       </div>
       <div class="meta" id="rMeta"></div>
+    </div>
+
+    <div class="verdict-card" id="verdictCard">
+      <div class="verdict-label">지금 진입해도 될까?</div>
+      <div class="verdict-main" id="vVerdict"></div>
+      <div class="gauge"><div class="gauge-fill" id="vGaugeFill"></div></div>
+      <div class="verdict-score"><span id="vScore"></span> <span class="verdict-score-max">/ 100점</span></div>
+      <div class="factors" id="vFactors"></div>
       <div id="rAction" class="action-badge"></div>
     </div>
 
@@ -310,39 +368,59 @@ async function runAnalysis() {
   $('errorBox').classList.remove('active');
   $('result').classList.remove('active');
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 120000); // 2분 타임아웃
-
   try {
+    // 1단계: 분석 작업 시작 (즉시 응답)
     const resp = await fetch('/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ticker, period: 'max' }),
-      signal: controller.signal,
     });
-    clearTimeout(timeoutId);
-    const data = await resp.json();
+    const init = await resp.json();
 
-    if (data.error) {
-      $('errorBox').textContent = data.error;
-      $('errorBox').classList.add('active');
-      return;
+    if (init.error) { showError(init.error); return; }
+
+    // 캐시 히트: 바로 렌더
+    if (init.status === 'done') { render(init.payload); $('result').classList.add('active'); return; }
+
+    // 2단계: 결과 폴링 (3초 간격, 최대 5분)
+    const jobId = init.job_id;
+    const deadline = Date.now() + 5 * 60 * 1000;
+    let elapsed = 0;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 3000));
+      elapsed += 3;
+      $('spinner').querySelector('p') && ($('spinner').querySelector('p').textContent = `분석 중... ${elapsed}초`);
+
+      const poll = await fetch(`/result/${jobId}`);
+      const data = await poll.json();
+
+      if (data.status === 'done') {
+        render(data.payload);
+        $('result').classList.add('active');
+        return;
+      }
+      if (data.status === 'error') { showError(data.error); return; }
+      // pending → 계속 폴링
     }
-
-    render(data);
-    $('result').classList.add('active');
+    showError('시간이 너무 오래 걸립니다. 잠시 후 다시 시도해주세요.');
   } catch(e) {
-    clearTimeout(timeoutId);
-    if (e.name === 'AbortError') {
-      $('errorBox').textContent = '요청 시간이 초과됐습니다. 잠시 후 다시 시도해주세요.';
-    } else {
-      $('errorBox').textContent = '서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.';
-    }
-    $('errorBox').classList.add('active');
+    showError('서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.');
   } finally {
     $('spinner').classList.remove('active');
     $('analyzeBtn').disabled = false;
   }
+}
+
+function showError(msg) {
+  $('errorBox').textContent = msg;
+  $('errorBox').classList.add('active');
+}
+
+function scoreColor(s) {
+  if (s >= 75) return '#3fb950';
+  if (s >= 60) return '#7ee787';
+  if (s >= 40) return '#f0883e';
+  return '#f85149';
 }
 
 function render(d) {
@@ -353,8 +431,33 @@ function render(d) {
     : '<span class="tag bear">현금</span>';
   $('rMeta').textContent = `${d.start_date} ~ ${d.as_of} | ${d.rows.toLocaleString()}거래일 | 신뢰도: ${d.confidence}`;
 
+  // 진입 판정 카드
+  const score = d.entry_score ?? 0;
+  const verdict = d.entry_verdict || '-';
+  const vMain = $('vVerdict');
+  vMain.textContent = verdict;
+  const vClass = verdict.includes('적극') ? 'buy' : verdict.includes('고려') ? 'consider' : verdict.includes('관망') ? 'wait' : 'avoid';
+  vMain.className = 'verdict-main ' + vClass;
+  $('vScore').textContent = Math.round(score);
+  const col = scoreColor(score);
+  $('vGaugeFill').style.width = score + '%';
+  $('vGaugeFill').style.background = col;
+
+  const fWrap = $('vFactors');
+  fWrap.innerHTML = (d.entry_factors || []).map(f => {
+    const c = scoreColor(f.score);
+    return `<div class="factor">
+      <div class="factor-top">
+        <span class="factor-name">${f.name} <span style="color:var(--muted);font-weight:400">(비중 ${f.weight}%)</span></span>
+        <span class="factor-score" style="color:${c}">${f.score}점</span>
+      </div>
+      <div class="factor-detail">${f.detail}</div>
+      <div class="factor-bar"><div class="factor-bar-fill" style="width:${f.score}%;background:${c}"></div></div>
+    </div>`;
+  }).join('');
+
   const act = $('rAction');
-  act.textContent = d.action;
+  act.textContent = '전략 신호: ' + d.action;
   act.className = 'action-badge ' + (d.invested_now ? 'bull' : d.action.includes('매수') ? 'bull' : d.action.includes('매도') || d.action.includes('청산') ? 'bear' : 'hold');
 
   if (d.chart) {
@@ -423,6 +526,23 @@ $('tickerInput').addEventListener('keydown', e => { if (e.key === 'Enter') runAn
 
 
 if __name__ == "__main__":
+    import threading
+    import webbrowser
+
     import uvicorn
+
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("webapp:app", host="0.0.0.0", port=port, reload=False)
+    local_url = f"http://127.0.0.1:{port}"
+
+    # 로컬 실행일 때만 브라우저 자동 열기 (PORT 환경변수가 없으면 로컬로 간주)
+    if not os.getenv("PORT"):
+        print("\n" + "=" * 50)
+        print("  Long-Term Quant 앱이 실행됩니다")
+        print(f"  브라우저 주소: {local_url}")
+        print("  같은 와이파이의 폰에서 접속하려면:")
+        print(f"    http://<이 컴퓨터의 IP>:{port}")
+        print("  종료하려면 이 창에서 Ctrl+C 를 누르세요")
+        print("=" * 50 + "\n")
+        threading.Timer(1.5, lambda: webbrowser.open(local_url)).start()
+
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)

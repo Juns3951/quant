@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import math
 import os
 import time
+import uuid
 from typing import Any
 
 from fastapi import FastAPI
@@ -15,9 +17,12 @@ from stock_analyzer import AnalyzerError, analyze_ticker, pct, _fmt_ratio, _fmt_
 
 app = FastAPI(title="Long-Term Quant Analyzer")
 
-# 티커별 분석 결과를 1시간 동안 캐시 (rate limit 방지)
+# 결과 캐시 (1시간)
 _cache: dict[str, tuple[float, Any]] = {}
 _CACHE_TTL = 3600
+
+# 백그라운드 작업 저장소
+_jobs: dict[str, dict[str, Any]] = {}
 
 
 def _get_cached(key: str) -> Any | None:
@@ -31,34 +36,7 @@ def _set_cache(key: str, value: Any) -> None:
     _cache[key] = (time.time(), value)
 
 
-class AnalyzeRequest(BaseModel):
-    ticker: str
-    period: str = "max"
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
-    return HTMLResponse(HTML)
-
-
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest) -> JSONResponse:
-    ticker = req.ticker.strip().upper()
-    if not ticker:
-        return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
-
-    cache_key = f"{ticker}:{req.period}"
-    cached = _get_cached(cache_key)
-    if cached:
-        return JSONResponse(cached)
-
-    try:
-        result = analyze_ticker(ticker, req.period)
-    except AnalyzerError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    except Exception as exc:
-        return JSONResponse({"error": f"분석 오류: {exc}"}, status_code=500)
-
+def _build_payload(result: Any) -> dict[str, Any]:
     chart_bytes = generate_backtest_chart(result)
     chart_b64 = base64.b64encode(chart_bytes).decode() if chart_bytes else None
 
@@ -78,7 +56,7 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
                 "exit_reason": row["Exit Reason"],
             })
 
-    payload = {
+    return {
         "ticker": result.ticker,
         "as_of": result.as_of,
         "start_date": result.start_date,
@@ -114,8 +92,57 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
         "trades": trades_data,
         "chart": chart_b64,
     }
-    _set_cache(cache_key, payload)
-    return JSONResponse(payload)
+
+
+async def _run_job(job_id: str, ticker: str, period: str, cache_key: str) -> None:
+    try:
+        result = await asyncio.to_thread(analyze_ticker, ticker, period)
+        payload = await asyncio.to_thread(_build_payload, result)
+        _set_cache(cache_key, payload)
+        _jobs[job_id] = {"status": "done", "payload": payload}
+    except AnalyzerError as exc:
+        _jobs[job_id] = {"status": "error", "error": str(exc)}
+    except Exception as exc:
+        _jobs[job_id] = {"status": "error", "error": f"분석 오류: {exc}"}
+
+
+class AnalyzeRequest(BaseModel):
+    ticker: str
+    period: str = "max"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    return HTMLResponse(HTML)
+
+
+@app.post("/analyze")
+async def analyze(req: AnalyzeRequest) -> JSONResponse:
+    ticker = req.ticker.strip().upper()
+    if not ticker:
+        return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
+
+    cache_key = f"{ticker}:{req.period}"
+    cached = _get_cached(cache_key)
+    if cached:
+        return JSONResponse({"status": "done", "payload": cached})
+
+    job_id = uuid.uuid4().hex[:10]
+    _jobs[job_id] = {"status": "pending"}
+    asyncio.create_task(_run_job(job_id, ticker, req.period, cache_key))
+    return JSONResponse({"status": "pending", "job_id": job_id})
+
+
+@app.get("/result/{job_id}")
+async def get_result(job_id: str) -> JSONResponse:
+    job = _jobs.get(job_id)
+    if not job:
+        return JSONResponse({"status": "error", "error": "작업을 찾을 수 없습니다."}, status_code=404)
+    if job["status"] == "pending":
+        return JSONResponse({"status": "pending"})
+    if job["status"] == "error":
+        return JSONResponse({"status": "error", "error": job["error"]})
+    return JSONResponse({"status": "done", "payload": job["payload"]})
 
 
 HTML = """<!DOCTYPE html>
@@ -218,7 +245,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div id="errorBox" class="error-box"></div>
-  <div id="spinner" class="spinner">⏳ 데이터 수집 중...<br><small style="font-size:0.75rem;opacity:0.7">처음 접속 시 서버 워밍업으로 최대 60초 소요될 수 있습니다</small></div>
+  <div id="spinner" class="spinner"><p>⏳ 분석 시작 중...</p><small style="font-size:0.75rem;opacity:0.7">처음에는 데이터 수집으로 1~2분 걸릴 수 있습니다</small></div>
 
   <div id="result">
     <div class="result-header">
@@ -310,39 +337,52 @@ async function runAnalysis() {
   $('errorBox').classList.remove('active');
   $('result').classList.remove('active');
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 120000); // 2분 타임아웃
-
   try {
+    // 1단계: 분석 작업 시작 (즉시 응답)
     const resp = await fetch('/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ticker, period: 'max' }),
-      signal: controller.signal,
     });
-    clearTimeout(timeoutId);
-    const data = await resp.json();
+    const init = await resp.json();
 
-    if (data.error) {
-      $('errorBox').textContent = data.error;
-      $('errorBox').classList.add('active');
-      return;
+    if (init.error) { showError(init.error); return; }
+
+    // 캐시 히트: 바로 렌더
+    if (init.status === 'done') { render(init.payload); $('result').classList.add('active'); return; }
+
+    // 2단계: 결과 폴링 (3초 간격, 최대 5분)
+    const jobId = init.job_id;
+    const deadline = Date.now() + 5 * 60 * 1000;
+    let elapsed = 0;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 3000));
+      elapsed += 3;
+      $('spinner').querySelector('p') && ($('spinner').querySelector('p').textContent = `분석 중... ${elapsed}초`);
+
+      const poll = await fetch(`/result/${jobId}`);
+      const data = await poll.json();
+
+      if (data.status === 'done') {
+        render(data.payload);
+        $('result').classList.add('active');
+        return;
+      }
+      if (data.status === 'error') { showError(data.error); return; }
+      // pending → 계속 폴링
     }
-
-    render(data);
-    $('result').classList.add('active');
+    showError('시간이 너무 오래 걸립니다. 잠시 후 다시 시도해주세요.');
   } catch(e) {
-    clearTimeout(timeoutId);
-    if (e.name === 'AbortError') {
-      $('errorBox').textContent = '요청 시간이 초과됐습니다. 잠시 후 다시 시도해주세요.';
-    } else {
-      $('errorBox').textContent = '서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.';
-    }
-    $('errorBox').classList.add('active');
+    showError('서버에 연결할 수 없습니다. 페이지를 새로고침 후 다시 시도해주세요.');
   } finally {
     $('spinner').classList.remove('active');
     $('analyzeBtn').disabled = false;
   }
+}
+
+function showError(msg) {
+  $('errorBox').textContent = msg;
+  $('errorBox').classList.add('active');
 }
 
 function render(d) {

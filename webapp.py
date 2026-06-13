@@ -15,6 +15,7 @@ import contextlib
 import json
 import math
 import os
+import random
 import sqlite3
 import time
 import uuid
@@ -37,33 +38,55 @@ app = FastAPI(title="Long-Term Quant Analyzer")
 _DB_PATH = Path(__file__).resolve().parent / ".jobs.db"
 _CACHE_TTL = 3600   # seconds
 _JOB_TTL = 7200     # keep completed jobs 2h so mobile can re-poll after sleep
+_MAX_RETRIES = 3
+_BASE_BACKOFF = 5.0     # seconds, doubles each attempt
+_MAX_BACKOFF  = 60.0    # seconds cap
 
 
 @contextlib.contextmanager
 def _db():
-    conn = sqlite3.connect(str(_DB_PATH), timeout=10)
+    """Read context — no exclusive lock."""
+    conn = sqlite3.connect(str(_DB_PATH), timeout=10, isolation_level=None)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         yield conn
-        conn.commit()
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
+def _db_write():
+    """Write context — BEGIN IMMEDIATE for concurrent-safe writes."""
+    conn = sqlite3.connect(str(_DB_PATH), timeout=15, isolation_level=None)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
     except Exception:
-        conn.rollback()
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
         raise
     finally:
         conn.close()
 
 
 def _init_db() -> None:
-    with _db() as conn:
+    with _db_write() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
-                job_id     TEXT PRIMARY KEY,
-                status     TEXT NOT NULL DEFAULT 'pending',
-                payload    TEXT,
-                error      TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                job_id      TEXT PRIMARY KEY,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                payload     TEXT,
+                error       TEXT,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                retry_after REAL DEFAULT NULL,
+                created_at  REAL NOT NULL,
+                updated_at  REAL NOT NULL
             )
         """)
         conn.execute("""
@@ -74,6 +97,25 @@ def _init_db() -> None:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at)")
+    # Migration: add columns if they don't exist in an older DB
+    _migrate_db()
+
+
+def _migrate_db() -> None:
+    """Add columns introduced in v3 to an existing jobs table."""
+    try:
+        with _db() as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        new_cols: list[tuple[str, str]] = []
+        if "attempts" not in cols:
+            new_cols.append(("attempts", "INTEGER NOT NULL DEFAULT 0"))
+        if "retry_after" not in cols:
+            new_cols.append(("retry_after", "REAL DEFAULT NULL"))
+        for col_name, col_def in new_cols:
+            with _db_write() as conn:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col_name} {col_def}")
+    except Exception:
+        pass
 
 
 _init_db()
@@ -99,7 +141,7 @@ def _job_get(job_id: str) -> dict | None:
 
 def _job_set_pending(job_id: str) -> None:
     now = time.time()
-    with _db() as conn:
+    with _db_write() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO jobs (job_id, status, created_at, updated_at) VALUES (?, 'pending', ?, ?)",
             (job_id, now, now),
@@ -108,7 +150,7 @@ def _job_set_pending(job_id: str) -> None:
 
 def _job_set_done(job_id: str, payload: dict) -> None:
     now = time.time()
-    with _db() as conn:
+    with _db_write() as conn:
         conn.execute(
             "UPDATE jobs SET status='done', payload=?, updated_at=? WHERE job_id=?",
             (json.dumps(payload), now, job_id),
@@ -117,17 +159,39 @@ def _job_set_done(job_id: str, payload: dict) -> None:
 
 def _job_set_error(job_id: str, error: str) -> None:
     now = time.time()
-    with _db() as conn:
+    with _db_write() as conn:
         conn.execute(
             "UPDATE jobs SET status='error', error=?, updated_at=? WHERE job_id=?",
             (error, now, job_id),
         )
 
 
+def _job_set_running(job_id: str) -> None:
+    now = time.time()
+    with _db_write() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='running', attempts=attempts+1, "
+            "retry_after=NULL, updated_at=? WHERE job_id=?",
+            (now, job_id),
+        )
+
+
+def _job_set_retrying(job_id: str, error: str, attempt: int) -> None:
+    backoff = min(_BASE_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0.0, 1.0), _MAX_BACKOFF)
+    retry_after = time.time() + backoff
+    now = time.time()
+    with _db_write() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='retrying', error=?, retry_after=?, updated_at=? "
+            "WHERE job_id=?",
+            (error, retry_after, now, job_id),
+        )
+
+
 def _job_cleanup() -> None:
     """Delete jobs older than _JOB_TTL seconds."""
     cutoff = time.time() - _JOB_TTL
-    with _db() as conn:
+    with _db_write() as conn:
         conn.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,))
 
 
@@ -151,7 +215,7 @@ def _cache_get(key: str) -> Any | None:
 
 
 def _cache_set(key: str, value: Any) -> None:
-    with _db() as conn:
+    with _db_write() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO cache (cache_key, payload, created_at) VALUES (?, ?, ?)",
             (key, json.dumps(value), time.time()),
@@ -245,18 +309,27 @@ def _build_payload(result: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def _run_job(job_id: str, ticker: str, period: str, cache_key: str) -> None:
-    try:
-        result = await asyncio.to_thread(analyze_ticker, ticker, period)
-        payload = await asyncio.to_thread(_build_payload, result)
-        _cache_set(cache_key, payload)
-        _job_set_done(job_id, payload)
-    except AnalyzerError as exc:
-        _job_set_error(job_id, str(exc))
-    except Exception as exc:
-        _job_set_error(job_id, f"분석 오류: {exc}")
-    finally:
-        # Async cleanup of stale jobs (fire-and-forget)
-        asyncio.get_event_loop().run_in_executor(None, _job_cleanup)
+    for attempt in range(_MAX_RETRIES + 1):
+        _job_set_running(job_id)
+        try:
+            result = await asyncio.to_thread(analyze_ticker, ticker, period)
+            payload = await asyncio.to_thread(_build_payload, result)
+            _cache_set(cache_key, payload)
+            _job_set_done(job_id, payload)
+            asyncio.get_event_loop().run_in_executor(None, _job_cleanup)
+            return
+        except AnalyzerError as exc:
+            # Permanent failure (invalid ticker, data unavailable) — no retry
+            _job_set_error(job_id, str(exc))
+            return
+        except Exception as exc:
+            if attempt >= _MAX_RETRIES:
+                _job_set_error(job_id, f"분석 오류: {exc}")
+                asyncio.get_event_loop().run_in_executor(None, _job_cleanup)
+                return
+            _job_set_retrying(job_id, str(exc), attempt + 1)
+            backoff = min(_BASE_BACKOFF * (2 ** attempt) + random.uniform(0.0, 1.0), _MAX_BACKOFF)
+            await asyncio.sleep(backoff)
 
 
 # ---------------------------------------------------------------------------
@@ -295,10 +368,10 @@ async def get_result(job_id: str) -> JSONResponse:
     job = _job_get(job_id)
     if not job:
         return JSONResponse({"status": "error", "error": "작업을 찾을 수 없습니다."}, status_code=404)
-    if job["status"] == "pending":
+    if job["status"] in ("pending", "running", "retrying"):
         return JSONResponse({"status": "pending"})
     if job["status"] == "error":
-        return JSONResponse({"status": "error", "error": job["error"]})
+        return JSONResponse({"status": "error", "error": job.get("error", "알 수 없는 오류")})
     return JSONResponse({"status": "done", "payload": job["payload"]})
 
 

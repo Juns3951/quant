@@ -341,6 +341,91 @@ class TestEdgeCases:
         result = analyze_price_frame("FLAT", frame)
         assert result.num_trades == 0
 
+    def test_trading_halt_interpolation(self):
+        """Zero-volume (trading halt) rows have their prices interpolated, not kept as sentinel."""
+        frame = _make_frame(rows=600)
+        # Mark rows 100–110 as a trading halt
+        frame.iloc[100:111, frame.columns.get_loc("Volume")] = 0
+        frame.iloc[100:111, frame.columns.get_loc("Close")] = 999.0
+
+        bt = Backtester(BacktestConfig())
+        prepared = bt.prepare(clean_price_frame(frame))
+
+        halt_closes = prepared["Close"].iloc[100:111]
+        # interpolate_trading_halts must have replaced the 999.0 sentinel values
+        assert not (halt_closes == 999.0).any(), (
+            "Sentinel 999.0 still present after interpolation"
+        )
+        # Values must be numeric (not NaN) after interpolation
+        assert not halt_closes.isna().any(), (
+            "Close values are NaN after interpolation — expected linear fill"
+        )
+
+    def test_penny_stock_stop_floor(self):
+        """ATR trailing stop must never fall below 1% of current close (penny-stock floor)."""
+        rows = 700
+        dates = pd.date_range("2020-01-01", periods=rows, freq="B")
+        close = np.concatenate([
+            np.linspace(0.50, 0.20, 251),
+            np.linspace(0.20, 2.00, 300),
+            np.linspace(2.00, 0.80, 149),
+        ])
+        high = close + 0.05
+        low = np.maximum(close - 0.05, 0.001)
+        frame = pd.DataFrame(
+            {"Open": close, "High": high, "Low": low, "Close": close,
+             "Volume": np.ones(rows) * 1_000_000},
+            index=dates,
+        )
+        cfg = BacktestConfig(atr_multiplier=3.5)
+        bt = Backtester(cfg)
+        strat = GoldenCrossStrategy(cfg)
+        cleaned = clean_price_frame(frame)
+        prepared = bt.prepare(cleaned).dropna(subset=["EMA_50", "SMA_200", "ATR_14"])
+        strat._attach(prepared)
+        strat.reset()
+
+        closes_arr = prepared["Close"].to_numpy()
+        for i in range(len(prepared)):
+            if strat._in_position:
+                strat.update_trailing(closes_arr[i])
+                stop = strat.trailing_stop(i)
+                if not np.isnan(stop):
+                    assert stop >= closes_arr[i] * 0.01, (
+                        f"Stop {stop:.6f} below 1% floor at i={i}"
+                    )
+            if i < len(prepared) - 1:
+                strat.next(i)
+            # Simulate entry/exit state transitions
+            if strat._pending == "BUY" and not strat._in_position:
+                strat._in_position = True
+                strat._highest_close = closes_arr[i]
+                strat._pending = None
+            elif strat._pending == "SELL" and strat._in_position:
+                strat._was_stopped = (strat._exit_reason == "ATR Stop")
+                strat._in_position = False
+                strat._highest_close = 0.0
+                strat._pending = None
+
+    def test_time_inversion_normalization(self):
+        """clean_price_frame must sort a descending-index frame into ascending order."""
+        frame = _make_frame(rows=600)
+        reversed_frame = frame.iloc[::-1].copy()
+
+        # Confirm the reversal is actually descending
+        assert reversed_frame.index[0] > reversed_frame.index[-1], (
+            "Reversed frame index should be descending"
+        )
+
+        cleaned = clean_price_frame(reversed_frame)
+        assert cleaned.index[0] < cleaned.index[-1], (
+            "clean_price_frame should sort index ascending"
+        )
+
+        # Full pipeline must also survive a reversed frame without crashing
+        result = analyze_price_frame("SORT_TEST", reversed_frame)
+        assert result.rows > 0, "analyze_price_frame crashed on reversed-index frame"
+
 
 # ---------------------------------------------------------------------------
 # 6. API payload — no NaN / Inf

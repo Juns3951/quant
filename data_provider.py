@@ -5,6 +5,8 @@ Fetch order:
   1. SQLite cache (instant, no network)
   2. yfinance (primary network source)
   3. Tiingo REST API (fallback — requires TIINGO_API_KEY env var)
+  4. Alpaca Markets API (fallback — requires ALPACA_API_KEY and ALPACA_SECRET_KEY env vars)
+  5. Alpha Vantage API (fallback — requires ALPHAVANTAGE_API_KEY env var)
 
 The cache stores adjusted OHLCV per ticker.  On each call it checks the last
 cached date and downloads only the missing tail (incremental patching), so
@@ -212,6 +214,131 @@ def _fetch_tiingo(ticker: str, start: str, end: str | None = None) -> pd.DataFra
 
 
 # ---------------------------------------------------------------------------
+# Alpaca fallback
+# ---------------------------------------------------------------------------
+
+def _fetch_alpaca(ticker: str, start: str, end: str | None = None) -> pd.DataFrame:
+    """
+    Alpaca Markets v2 historical bars fallback.
+    Requires ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables.
+    Returns adjusted OHLCV DataFrame; empty if keys missing or request fails.
+    """
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        return pd.DataFrame()
+
+    end_str = end or pd.Timestamp.today().strftime("%Y-%m-%d")
+    bars: list = []
+    next_page_token: str | None = None
+
+    try:
+        while True:
+            url = (
+                f"https://data.alpaca.markets/v2/stocks/{ticker.upper()}/bars"
+                f"?start={start}T00:00:00Z&end={end_str}T00:00:00Z"
+                f"&timeframe=1Day&feed=sip&adjustment=all&limit=10000"
+            )
+            if next_page_token:
+                from urllib.parse import quote
+                url += f"&page_token={quote(next_page_token)}"
+
+            req = Request(
+                url,
+                headers={
+                    "APCA-API-KEY-ID": api_key,
+                    "APCA-API-SECRET-KEY": secret_key,
+                },
+            )
+            with urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read())
+
+            page_bars = payload.get("bars")
+            if not page_bars:
+                break
+            bars.extend(page_bars)
+
+            next_page_token = payload.get("next_page_token")
+            if not next_page_token:
+                break
+
+        if not bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(bars)
+        df = df.rename(columns={"t": "Date", "o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        df["Date"] = pd.to_datetime(df["Date"])
+        # Convert tz-aware timestamps to tz-naive
+        if df["Date"].dt.tz is not None:
+            df["Date"] = df["Date"].dt.tz_convert("UTC").dt.tz_localize(None)
+        df = df.set_index("Date").sort_index()
+        available = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+        return df[available].apply(pd.to_numeric, errors="coerce")
+    except Exception as exc:
+        logger.debug("Alpaca fetch failed for %s: %s", ticker, exc)
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# Alpha Vantage fallback
+# ---------------------------------------------------------------------------
+
+def _fetch_alphavantage(ticker: str, start: str, end: str | None = None) -> pd.DataFrame:
+    """
+    Alpha Vantage TIME_SERIES_DAILY_ADJUSTED fallback.
+    Requires ALPHAVANTAGE_API_KEY environment variable.
+    Returns adjusted OHLCV DataFrame; empty if key missing, rate-limited, or request fails.
+    """
+    api_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
+    if not api_key:
+        return pd.DataFrame()
+
+    end_str = end or pd.Timestamp.today().strftime("%Y-%m-%d")
+    url = (
+        f"https://www.alphavantage.co/query"
+        f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker.upper()}"
+        f"&outputsize=full&apikey={api_key}"
+    )
+    try:
+        req = Request(url, headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read())
+
+        # Detect rate-limit / informational responses
+        if "Note" in payload or "Information" in payload:
+            logger.debug("Alpha Vantage rate-limited for %s", ticker)
+            return pd.DataFrame()
+
+        ts = payload.get("Time Series (Daily)")
+        if not ts:
+            return pd.DataFrame()
+
+        rows = []
+        for date_str, entry in ts.items():
+            if date_str < start or date_str > end_str:
+                continue
+            rows.append({
+                "Date": date_str,
+                "Open": entry.get("1. open"),
+                "High": entry.get("2. high"),
+                "Low": entry.get("3. low"),
+                "Close": entry.get("5. adjusted close"),
+                "Volume": entry.get("6. volume"),
+            })
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        return df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+    except Exception as exc:
+        logger.debug("Alpha Vantage fetch failed for %s: %s", ticker, exc)
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
 
@@ -227,9 +354,10 @@ def fetch_price_data(
 
     Strategy:
     1. Consult SQLite cache; if fresh enough, return immediately.
-    2. Download only the missing tail from yfinance (incremental patch).
-    3. If yfinance fails, try Tiingo.
-    4. Save new rows to cache.
+    2. Download only the missing tail from the first available source
+       (incremental patch), trying in order:
+         yfinance → Tiingo → Alpaca → Alpha Vantage
+    3. Save new rows to cache.
     """
     _init_cache_db(db_path)
 
@@ -254,14 +382,24 @@ def fetch_price_data(
         dl_start = (pd.Timestamp(last_cached) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
     new_data = pd.DataFrame()
-    try:
-        new_data = _fetch_yfinance(ticker, start=dl_start)
-    except Exception as yf_exc:
-        logger.warning("yfinance failed, trying Tiingo: %s", yf_exc)
+    _sources = [
+        ("yfinance",       lambda: _fetch_yfinance(ticker, start=dl_start)),
+        ("Tiingo",         lambda: _fetch_tiingo(ticker, start=dl_start)),
+        ("Alpaca",         lambda: _fetch_alpaca(ticker, start=dl_start)),
+        ("Alpha Vantage",  lambda: _fetch_alphavantage(ticker, start=dl_start)),
+    ]
+    for source_name, fetch_fn in _sources:
+        logger.info("Trying %s for %s ...", source_name, ticker)
         try:
-            new_data = _fetch_tiingo(ticker, start=dl_start)
-        except Exception as tiingo_exc:
-            logger.warning("Tiingo also failed: %s", tiingo_exc)
+            result = fetch_fn()
+        except Exception as exc:
+            logger.warning("%s failed for %s: %s", source_name, ticker, exc)
+            continue
+        if not result.empty:
+            logger.info("%s succeeded for %s", source_name, ticker)
+            new_data = result
+            break
+        logger.debug("%s returned empty data for %s", source_name, ticker)
 
     if not new_data.empty:
         _cache_save(ticker, new_data, db_path)

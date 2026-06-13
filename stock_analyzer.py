@@ -32,6 +32,7 @@ from backtest_engine import (
     Backtester,
     BacktestConfig,
     GoldenCrossStrategy,
+    OptimizationEngine,
     TradeRecord,
     bootstrap_ci,
     compute_metrics,
@@ -114,6 +115,11 @@ class LongTermResult:
     slippage_beta: float = 0.0
     reentry_mode: str = "next_cross"
     adj_close_warnings: list[str] | None = None
+    # ── Wave 3 additions ─────────────────────────────────────────────────
+    slippage_sweep: list[dict] | None = None
+    strategy_rejected: bool = False
+    rejection_reason: str = ""
+    parameter_drift: float = float("nan")
 
 
 class AnalyzerError(RuntimeError):
@@ -154,6 +160,7 @@ def analyze_ticker(
     commission_bps: float = 5.0,
     slippage_beta: float = 0.1,
     reentry_mode: str = "next_cross",
+    run_slippage_sweep: bool = False,
 ) -> LongTermResult:
     del benchmark_ticker
     ticker = ticker.strip().upper()
@@ -165,6 +172,7 @@ def analyze_ticker(
         commission_bps=commission_bps,
         slippage_beta=slippage_beta,
         reentry_mode=reentry_mode,
+        run_slippage_sweep=run_slippage_sweep,
     )
 
 
@@ -179,6 +187,7 @@ def analyze_price_frame(
     reentry_mode: str = "next_cross",
     run_bootstrap: bool = False,   # slow — off by default
     run_wfa: bool = False,         # very slow — off by default
+    run_slippage_sweep: bool = False,
 ) -> LongTermResult:
     """
     Core analysis pipeline:
@@ -248,15 +257,28 @@ def analyze_price_frame(
         ])
 
     # --- 7. Bootstrap CI (optional) ---
-    boot: dict[str, float] = {"sharpe_ci_lower": float("nan"), "pf_ci_lower": float("nan")}
+    boot: dict[str, Any] = {
+        "sharpe_ci_lower": float("nan"),
+        "pf_ci_lower": float("nan"),
+        "strategy_rejected": False,
+        "rejection_reason": "",
+    }
     if run_bootstrap:
-        boot = bootstrap_ci(trade_records)
+        boot = OptimizationEngine().bootstrap_ci(trade_records, n_boot=10_000)
 
     # --- 8. Rolling metrics ---
     eq = df["Strategy_Equity"]
     rc3y = float(_rolling_cagr(eq, 3.0).iloc[-1]) if len(df) >= 3 * TRADING_DAYS else float("nan")
     rc5y = float(_rolling_cagr(eq, 5.0).iloc[-1]) if len(df) >= 5 * TRADING_DAYS else float("nan")
     rm3y = float(_rolling_mdd(df["Strategy_Drawdown"], 3.0).iloc[-1]) if len(df) >= 3 * TRADING_DAYS else float("nan")
+
+    # --- 9. Slippage sweep (optional) ---
+    sweep_results: list[dict] | None = None
+    if run_slippage_sweep:
+        try:
+            sweep_results = OptimizationEngine().slippage_sweep(df, cfg)
+        except Exception:
+            sweep_results = None
 
     return LongTermResult(
         ticker=ticker.strip().upper(),
@@ -316,6 +338,10 @@ def analyze_price_frame(
         slippage_beta=slippage_beta,
         reentry_mode=reentry_mode,
         adj_close_warnings=adj_warnings if adj_warnings else None,
+        slippage_sweep=sweep_results,
+        strategy_rejected=bool(boot.get("strategy_rejected", False)),
+        rejection_reason=str(boot.get("rejection_reason", "")),
+        parameter_drift=float("nan"),
     )
 
 

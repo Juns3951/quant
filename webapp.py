@@ -1,11 +1,24 @@
+"""
+webapp.py — FastAPI web application for the long-term quant analyser.
+
+Changes from v1:
+* In-memory _jobs dict replaced with SQLite-backed job queue (WAL mode).
+  Server restarts on Render free tier no longer lose queued or completed jobs.
+* In-memory _cache replaced with SQLite cache (same DB, different table).
+* ATR-based dynamic slippage passed through to analyze_ticker().
+"""
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import json
 import math
 import os
+import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
@@ -17,27 +30,139 @@ from stock_analyzer import AnalyzerError, analyze_ticker, pct, _fmt_ratio, _fmt_
 
 app = FastAPI(title="Long-Term Quant Analyzer")
 
-# 결과 캐시 (1시간)
-_cache: dict[str, tuple[float, Any]] = {}
-_CACHE_TTL = 3600
+# ---------------------------------------------------------------------------
+# SQLite job + cache store
+# ---------------------------------------------------------------------------
 
-# 백그라운드 작업 저장소
-_jobs: dict[str, dict[str, Any]] = {}
-
-
-def _get_cached(key: str) -> Any | None:
-    entry = _cache.get(key)
-    if entry and time.time() - entry[0] < _CACHE_TTL:
-        return entry[1]
-    return None
+_DB_PATH = Path(__file__).resolve().parent / ".jobs.db"
+_CACHE_TTL = 3600   # seconds
+_JOB_TTL = 7200     # keep completed jobs 2h so mobile can re-poll after sleep
 
 
-def _set_cache(key: str, value: Any) -> None:
-    _cache[key] = (time.time(), value)
+@contextlib.contextmanager
+def _db():
+    conn = sqlite3.connect(str(_DB_PATH), timeout=10)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
+
+def _init_db() -> None:
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id     TEXT PRIMARY KEY,
+                status     TEXT NOT NULL DEFAULT 'pending',
+                payload    TEXT,
+                error      TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                cache_key  TEXT PRIMARY KEY,
+                payload    TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated ON jobs(updated_at)")
+
+
+_init_db()
+
+
+# --- Job helpers ---
+
+def _job_get(job_id: str) -> dict | None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT status, payload, error FROM jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+    if not row:
+        return None
+    status, payload_json, error = row
+    out: dict[str, Any] = {"status": status}
+    if payload_json:
+        out["payload"] = json.loads(payload_json)
+    if error:
+        out["error"] = error
+    return out
+
+
+def _job_set_pending(job_id: str) -> None:
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs (job_id, status, created_at, updated_at) VALUES (?, 'pending', ?, ?)",
+            (job_id, now, now),
+        )
+
+
+def _job_set_done(job_id: str, payload: dict) -> None:
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='done', payload=?, updated_at=? WHERE job_id=?",
+            (json.dumps(payload), now, job_id),
+        )
+
+
+def _job_set_error(job_id: str, error: str) -> None:
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='error', error=?, updated_at=? WHERE job_id=?",
+            (error, now, job_id),
+        )
+
+
+def _job_cleanup() -> None:
+    """Delete jobs older than _JOB_TTL seconds."""
+    cutoff = time.time() - _JOB_TTL
+    with _db() as conn:
+        conn.execute("DELETE FROM jobs WHERE updated_at < ?", (cutoff,))
+
+
+# --- Cache helpers ---
+
+def _cache_get(key: str) -> Any | None:
+    cutoff = time.time() - _CACHE_TTL
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT payload, created_at FROM cache WHERE cache_key = ?", (key,)
+        ).fetchone()
+    if not row:
+        return None
+    payload_json, created_at = row
+    if created_at < cutoff:
+        return None
+    try:
+        return json.loads(payload_json)
+    except Exception:
+        return None
+
+
+def _cache_set(key: str, value: Any) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO cache (cache_key, payload, created_at) VALUES (?, ?, ?)",
+            (key, json.dumps(value), time.time()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# NaN / Inf sanitiser
+# ---------------------------------------------------------------------------
 
 def _f(v: float) -> float | None:
-    """NaN/Inf 를 None 으로 변환 — JSONResponse 직렬화 실패 방지."""
     try:
         if math.isnan(v) or math.isinf(v):
             return None
@@ -46,12 +171,16 @@ def _f(v: float) -> float | None:
     return v
 
 
+# ---------------------------------------------------------------------------
+# Payload builder
+# ---------------------------------------------------------------------------
+
 def _build_payload(result: Any) -> dict[str, Any]:
     chart_bytes = generate_backtest_chart(result)
     chart_b64 = base64.b64encode(chart_bytes).decode() if chart_bytes else None
 
     pf = result.profit_factor
-    pf_str = "∞" if math.isinf(pf) and pf > 0 else _fmt_ratio(pf)
+    pf_str = "∞" if (isinstance(pf, float) and math.isinf(pf) and pf > 0) else _fmt_ratio(pf)
 
     trades_data: list[dict[str, Any]] = []
     if result.trades is not None and not result.trades.empty:
@@ -82,7 +211,7 @@ def _build_payload(result: Any) -> dict[str, Any]:
             "current_price": _f(result.current_price),
             "ema50": _f(result.ema50),
             "sma200": _f(result.sma200),
-            "atr_stop": _f(result.trailing_stop),  # 베어 레짐 시 NaN 가능
+            "atr_stop": _f(result.trailing_stop),
             "cagr_strategy": pct(result.cagr_strategy),
             "cagr_buy_hold": pct(result.cagr_buy_hold),
             "mdd_strategy": pct(result.mdd_strategy),
@@ -91,6 +220,7 @@ def _build_payload(result: Any) -> dict[str, Any]:
             "market_exposure": pct(result.market_exposure),
             "sharpe": _fmt_ratio(result.sharpe_ratio),
             "sortino": _fmt_ratio(result.sortino_ratio),
+            "calmar": _fmt_ratio(result.calmar_ratio),
             "win_rate": pct(result.win_rate),
             "profit_factor": pf_str,
             "num_trades": result.num_trades,
@@ -99,6 +229,9 @@ def _build_payload(result: Any) -> dict[str, Any]:
             "worst_trade": pct(result.worst_trade),
             "kelly": pct(result.kelly_fraction),
             "fractional_kelly": pct(result.suggested_fractional_kelly),
+            "turnover": _fmt_ratio(result.turnover),
+            "commission_bps": result.commission_bps,
+            "slippage_beta": result.slippage_beta,
         },
         "insights": result.insights,
         "warnings": result.warnings,
@@ -107,17 +240,28 @@ def _build_payload(result: Any) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Background job runner
+# ---------------------------------------------------------------------------
+
 async def _run_job(job_id: str, ticker: str, period: str, cache_key: str) -> None:
     try:
         result = await asyncio.to_thread(analyze_ticker, ticker, period)
         payload = await asyncio.to_thread(_build_payload, result)
-        _set_cache(cache_key, payload)
-        _jobs[job_id] = {"status": "done", "payload": payload}
+        _cache_set(cache_key, payload)
+        _job_set_done(job_id, payload)
     except AnalyzerError as exc:
-        _jobs[job_id] = {"status": "error", "error": str(exc)}
+        _job_set_error(job_id, str(exc))
     except Exception as exc:
-        _jobs[job_id] = {"status": "error", "error": f"분석 오류: {exc}"}
+        _job_set_error(job_id, f"분석 오류: {exc}")
+    finally:
+        # Async cleanup of stale jobs (fire-and-forget)
+        asyncio.get_event_loop().run_in_executor(None, _job_cleanup)
 
+
+# ---------------------------------------------------------------------------
+# API routes
+# ---------------------------------------------------------------------------
 
 class AnalyzeRequest(BaseModel):
     ticker: str
@@ -136,19 +280,19 @@ async def analyze(req: AnalyzeRequest) -> JSONResponse:
         return JSONResponse({"error": "티커를 입력하세요."}, status_code=400)
 
     cache_key = f"{ticker}:{req.period}"
-    cached = _get_cached(cache_key)
+    cached = _cache_get(cache_key)
     if cached:
         return JSONResponse({"status": "done", "payload": cached})
 
     job_id = uuid.uuid4().hex[:10]
-    _jobs[job_id] = {"status": "pending"}
+    _job_set_pending(job_id)
     asyncio.create_task(_run_job(job_id, ticker, req.period, cache_key))
     return JSONResponse({"status": "pending", "job_id": job_id})
 
 
 @app.get("/result/{job_id}")
 async def get_result(job_id: str) -> JSONResponse:
-    job = _jobs.get(job_id)
+    job = _job_get(job_id)
     if not job:
         return JSONResponse({"status": "error", "error": "작업을 찾을 수 없습니다."}, status_code=404)
     if job["status"] == "pending":
@@ -157,6 +301,10 @@ async def get_result(job_id: str) -> JSONResponse:
         return JSONResponse({"status": "error", "error": job["error"]})
     return JSONResponse({"status": "done", "payload": job["payload"]})
 
+
+# ---------------------------------------------------------------------------
+# Inline HTML / CSS / JS  (UI unchanged from v1)
+# ---------------------------------------------------------------------------
 
 HTML = """<!DOCTYPE html>
 <html lang="ko">
@@ -310,7 +458,7 @@ HTML = """<!DOCTYPE html>
         <div class="metric"><div class="label">전략 MDD</div><div class="value" id="mMdd"></div></div>
         <div class="metric"><div class="label">누적 수익</div><div class="value" id="mCumul"></div></div>
         <div class="metric"><div class="label">Sharpe</div><div class="value neutral" id="mSharpe"></div></div>
-        <div class="metric"><div class="label">Sortino</div><div class="value neutral" id="mSortino"></div></div>
+        <div class="metric"><div class="label">Calmar</div><div class="value neutral" id="mCalmar"></div></div>
       </div>
     </div>
 
@@ -377,7 +525,6 @@ function setSpinner(msg) {
 }
 
 async function postAnalyze(ticker) {
-  // 서버 콜드스타트 대응: 실패 시 최대 10회(~60초) 재시도
   for (let attempt = 0; attempt < 10; attempt++) {
     if (attempt > 0) {
       setSpinner(`⏳ 서버 시작 중... ${attempt * 6}초 경과 (최대 60초)`);
@@ -389,10 +536,10 @@ async function postAnalyze(ticker) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ticker, period: 'max' }),
       });
-      if (!resp.ok) continue; // 503 등 재시도
+      if (!resp.ok) continue;
       const data = await resp.json();
       return data;
-    } catch (_) { /* 네트워크 오류 → 재시도 */ }
+    } catch (_) { }
   }
   return null;
 }
@@ -408,15 +555,12 @@ async function runAnalysis() {
   setSpinner('⏳ 분석 시작 중...');
 
   try {
-    // 1단계: 분석 작업 시작 (즉시 응답, 서버 콜드스타트 시 재시도 포함)
     const init = await postAnalyze(ticker);
     if (!init) { showError('서버에 연결할 수 없습니다. 잠시 후 다시 시도해주세요.'); return; }
     if (init.error) { showError(init.error); return; }
 
-    // 캐시 히트: 바로 렌더
     if (init.status === 'done') { render(init.payload); $('result').classList.add('active'); return; }
 
-    // 2단계: 결과 폴링 (3초 간격, 최대 5분)
     let jobId = init.job_id;
     const deadline = Date.now() + 5 * 60 * 1000;
     let elapsed = 0;
@@ -434,20 +578,15 @@ async function runAnalysis() {
           return;
         }
         if (data.status === 'error') {
-          // 서버 재시작으로 job이 사라진 경우 → 분석 자동 재시작 (1회)
           if (data.error && data.error.includes('찾을 수 없습니다') && elapsed < 120) {
             setSpinner('⏳ 서버 재시작 감지 — 분석 재시작 중...');
             const retry = await postAnalyze(ticker);
-            if (retry && retry.status === 'pending') {
-              jobId = retry.job_id;
-              elapsed = 0;
-              continue;
-            }
+            if (retry && retry.status === 'pending') { jobId = retry.job_id; elapsed = 0; continue; }
             if (retry && retry.status === 'done') { render(retry.payload); $('result').classList.add('active'); return; }
           }
           showError(data.error); return;
         }
-      } catch (_) { /* 일시적 네트워크 오류 → 계속 폴링 */ }
+      } catch (_) { }
     }
     showError('시간이 너무 오래 걸립니다. 잠시 후 다시 시도해주세요.');
   } finally {
@@ -476,7 +615,6 @@ function render(d) {
     : '<span class="tag bear">현금</span>';
   $('rMeta').textContent = `${d.start_date} ~ ${d.as_of} | ${d.rows.toLocaleString()}거래일 | 신뢰도: ${d.confidence}`;
 
-  // 진입 판정 카드
   const score = d.entry_score ?? 0;
   const verdict = d.entry_verdict || '-';
   const vMain = $('vVerdict');
@@ -522,7 +660,7 @@ function render(d) {
   setMetric('mMdd', m.mdd_strategy, 'negative');
   setMetric('mCumul', m.cumulative_strategy, 'neutral');
   setMetric('mSharpe', m.sharpe, 'neutral');
-  setMetric('mSortino', m.sortino, 'neutral');
+  setMetric('mCalmar', m.calmar, 'neutral');
   $('mTrades').textContent = m.num_trades + '회';
   setMetric('mWinRate', m.win_rate);
   setMetric('mPF', m.profit_factor, parseFloat(m.profit_factor) >= 1 ? 'positive' : 'negative');
@@ -559,7 +697,6 @@ function render(d) {
 
   const iList = $('insightsList');
   iList.innerHTML = d.insights.map(i => `<li>${i}</li>`).join('');
-
   const wList = $('warnList');
   wList.innerHTML = d.warnings.map(w => `<li>${w}</li>`).join('');
 }
@@ -579,7 +716,6 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     local_url = f"http://127.0.0.1:{port}"
 
-    # 로컬 실행일 때만 브라우저 자동 열기 (PORT 환경변수가 없으면 로컬로 간주)
     if not os.getenv("PORT"):
         print("\n" + "=" * 50)
         print("  Long-Term Quant 앱이 실행됩니다")

@@ -1,8 +1,9 @@
+"""test_smoke.py — quick offline smoke test (no network)."""
 from __future__ import annotations
 
+import sys
 import numpy as np
 import pandas as pd
-import sys
 
 from stock_analyzer import analyze_price_frame, format_telegram_report
 
@@ -22,13 +23,7 @@ def make_sample_frame(rows: int = 800) -> pd.DataFrame:
     volume = rng.integers(800_000, 1_400_000, rows)
     volume[-1] = int(volume[-20:].mean() * 1.8)
     return pd.DataFrame(
-        {
-            "Open": open_,
-            "High": high,
-            "Low": low,
-            "Close": close,
-            "Volume": volume,
-        },
+        {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": volume},
         index=dates,
     )
 
@@ -41,13 +36,18 @@ if __name__ == "__main__":
     assert result.rows > 220
     assert result.trades is not None
     assert result.num_trades >= 0
-    # 진입 판정 검증
     assert 0.0 <= result.entry_score <= 100.0
     assert result.entry_verdict in {"적극 진입", "진입 고려", "관망", "진입 회피"}
     assert result.entry_factors and len(result.entry_factors) == 5
     assert "진입 판정" in report and "진입 적합도" in report
+    # New fields
+    assert hasattr(result, "calmar_ratio")
+    assert hasattr(result, "exposure_adj_cagr")
+    assert hasattr(result, "commission_bps")
+    assert result.commission_bps == 5.0
     if result.num_trades > 0:
         assert {"Entry Date", "Exit Date", "Return", "Exit Reason"}.issubset(result.trades.columns)
         assert 0.0 <= result.win_rate <= 1.0
         assert "트레이드별 성과" in report
     print(report)
+    print("\n✓ smoke test passed")

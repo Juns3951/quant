@@ -36,6 +36,16 @@ def _set_cache(key: str, value: Any) -> None:
     _cache[key] = (time.time(), value)
 
 
+def _f(v: float) -> float | None:
+    """NaN/Inf 를 None 으로 변환 — JSONResponse 직렬화 실패 방지."""
+    try:
+        if math.isnan(v) or math.isinf(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
+
+
 def _build_payload(result: Any) -> dict[str, Any]:
     chart_bytes = generate_backtest_chart(result)
     chart_b64 = base64.b64encode(chart_bytes).decode() if chart_bytes else None
@@ -65,14 +75,14 @@ def _build_payload(result: Any) -> dict[str, Any]:
         "regime": result.regime,
         "confidence": result.confidence,
         "invested_now": result.invested_now,
-        "entry_score": result.entry_score,
+        "entry_score": _f(result.entry_score),
         "entry_verdict": result.entry_verdict,
         "entry_factors": result.entry_factors or [],
         "metrics": {
-            "current_price": result.current_price,
-            "ema50": result.ema50,
-            "sma200": result.sma200,
-            "atr_stop": result.trailing_stop,
+            "current_price": _f(result.current_price),
+            "ema50": _f(result.ema50),
+            "sma200": _f(result.sma200),
+            "atr_stop": _f(result.trailing_stop),  # 베어 레짐 시 NaN 가능
             "cagr_strategy": pct(result.cagr_strategy),
             "cagr_buy_hold": pct(result.cagr_buy_hold),
             "mdd_strategy": pct(result.mdd_strategy),
@@ -407,7 +417,7 @@ async function runAnalysis() {
     if (init.status === 'done') { render(init.payload); $('result').classList.add('active'); return; }
 
     // 2단계: 결과 폴링 (3초 간격, 최대 5분)
-    const jobId = init.job_id;
+    let jobId = init.job_id;
     const deadline = Date.now() + 5 * 60 * 1000;
     let elapsed = 0;
     while (Date.now() < deadline) {
@@ -423,7 +433,20 @@ async function runAnalysis() {
           $('result').classList.add('active');
           return;
         }
-        if (data.status === 'error') { showError(data.error); return; }
+        if (data.status === 'error') {
+          // 서버 재시작으로 job이 사라진 경우 → 분석 자동 재시작 (1회)
+          if (data.error && data.error.includes('찾을 수 없습니다') && elapsed < 120) {
+            setSpinner('⏳ 서버 재시작 감지 — 분석 재시작 중...');
+            const retry = await postAnalyze(ticker);
+            if (retry && retry.status === 'pending') {
+              jobId = retry.job_id;
+              elapsed = 0;
+              continue;
+            }
+            if (retry && retry.status === 'done') { render(retry.payload); $('result').classList.add('active'); return; }
+          }
+          showError(data.error); return;
+        }
       } catch (_) { /* 일시적 네트워크 오류 → 계속 폴링 */ }
     }
     showError('시간이 너무 오래 걸립니다. 잠시 후 다시 시도해주세요.');
@@ -507,7 +530,7 @@ function render(d) {
   $('mBest').textContent = m.best_trade;
   $('mWorst').textContent = m.worst_trade;
 
-  const fmt = n => n >= 100 ? n.toLocaleString('en', {maximumFractionDigits:2}) : n.toFixed(2);
+  const fmt = n => (n === null || n === undefined) ? 'N/A' : (n >= 100 ? n.toLocaleString('en', {maximumFractionDigits:2}) : n.toFixed(2));
   $('mPrice').textContent = fmt(m.current_price);
   $('mStop').textContent = fmt(m.atr_stop);
   $('mEma').textContent = fmt(m.ema50);

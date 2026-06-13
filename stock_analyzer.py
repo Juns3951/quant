@@ -80,24 +80,51 @@ def fetch_history(ticker: str, period: str = "max", start: str = LONGTERM_START)
     cache_dir.mkdir(exist_ok=True)
     yf.set_tz_cache_location(str(cache_dir))
 
+    # rate limit 대응: 빈 DataFrame 반환 시에도 지연 증가
+    delays = [0, 5, 15, 30, 60]  # 5회 시도, 최대 ~110초
     last_exc: Exception | None = None
-    for attempt in range(4):
-        if attempt:
-            time.sleep(2 ** attempt)  # 2s, 4s, 8s
+
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
         try:
             if period == "max":
                 data = yf.Ticker(ticker).history(start=start, interval="1d", auto_adjust=True)
             else:
                 data = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=True)
             if not data.empty:
-                return data
+                return _normalize_history(data)
             last_exc = None
+
+            # Ticker.history() 실패 시 yf.download() 대안 시도
+            if attempt >= 2:
+                try:
+                    dl_kwargs = {"start": start} if period == "max" else {"period": period}
+                    data2 = yf.download(
+                        ticker, interval="1d", auto_adjust=True,
+                        progress=False, **dl_kwargs
+                    )
+                    if not data2.empty:
+                        return _normalize_history(data2)
+                except Exception:
+                    pass
         except Exception as exc:
             last_exc = exc
 
     if last_exc:
         raise AnalyzerError(f"데이터 수집 실패 ({ticker}): {last_exc}") from last_exc
-    raise AnalyzerError(f"{ticker} 데이터를 가져오지 못했습니다. 티커 표기를 확인하세요.")
+    raise AnalyzerError(
+        f"{ticker} 데이터를 가져오지 못했습니다. "
+        "야후파이낸스 요청이 제한되었을 수 있습니다. 1~2분 후 다시 시도해주세요."
+    )
+
+
+def _normalize_history(df: pd.DataFrame) -> pd.DataFrame:
+    """yf.download() MultiIndex 컬럼을 단일 컬럼으로 정규화."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    return df
 
 
 def analyze_ticker(
